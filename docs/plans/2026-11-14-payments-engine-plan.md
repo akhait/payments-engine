@@ -48,17 +48,20 @@ rejected, insufficient funds rejected, overflow rejected with no state change,
 account created by a valid deposit or withdrawal (rule 7). Dispute, resolve
 and chargeback return a `Rejection::Unsupported` placeholder for now.
 **Files**: `src/account.rs`, `src/transaction.rs`, `src/engine.rs`,
-`src/lib.rs`
+`src/lib.rs`, `src/amount.rs` (adds `Default` and `is_positive`)
 **Depends on**: Task 1
 **Verify**: `cargo test engine` passes AC 10 through 15 and the overflow
 no-change case of AC 9 (for example `deposit,1,1,3.0` then `withdrawal,1,2,1.5`
 leaves `available == 1.5`, `held == 0`; a withdrawal of 3.0 against 2.0
 leaves balances at 2.0; a first-row withdrawal leaves an all-zero account).
+**Status**: Complete
 
 ### Task 3: Dispute and resolve
 
-**What**: Add `DisputeState` and `DepositRecord`, and implement dispute and
-resolve in `Engine::apply`. Dispute requires a recorded deposit of the same
+**What**: Implement dispute and resolve in `Engine::apply`, using the
+`DisputeState` and `DepositRecord` types introduced in Task 2. Also add the
+`available + held` overflow check to `Account::credit` that Task 2 deferred
+(`held` is always zero until a dispute can happen). Dispute requires a recorded deposit of the same
 client in state `Normal`, moves the amount from available to held, and sets
 `Disputed`. Resolve requires a `Disputed` deposit of the same client, moves the
 amount back, and sets `Normal`. Neither creates an account. Available may go

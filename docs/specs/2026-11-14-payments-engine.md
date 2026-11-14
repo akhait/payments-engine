@@ -71,8 +71,9 @@ joins the workers and merges their account maps (client sets are disjoint).
 - `Account { available: Amount, held: Amount, locked: bool }`. `total()` is
   derived: `available.checked_add(held)`. The client id is the map key.
 - `DisputeState { Normal, Disputed, ChargedBack }`.
-- `DepositRecord { client: ClientId, amount: Amount, state: DisputeState }`.
-  Only deposits are stored, because only deposits can be disputed.
+- `DepositRecord { amount: Amount, state: DisputeState }`. Only deposits are
+  stored, because only deposits can be disputed. The engine keys them by
+  `(client, tx)`, so the client is part of the key.
 - `Transaction` enum: `Deposit{client, tx, amount}`, `Withdrawal{..}`,
   `Dispute{client, tx}`, `Resolve{client, tx}`, `Chargeback{client, tx}`.
   Built from a raw CSV row via `TryFrom`, so a deposit without an amount is
@@ -81,17 +82,18 @@ joins the workers and merges their account maps (client sets are disjoint).
 
 ### Engine (synchronous, no async)
 
-`Engine { accounts: HashMap<ClientId, Account>, deposits: HashMap<TxId, DepositRecord> }`
+`Engine { accounts: HashMap<ClientId, Account>, deposits: HashMap<(ClientId, TxId), DepositRecord> }`
 with `apply(&mut self, Transaction) -> Result<(), Rejection>`.
-A rejected transaction never changes state.
+A rejected transaction never changes state, except that a withdrawal refused
+for insufficient funds still creates the client's account (rule 7).
 
 | Transaction | Valid when | Effect |
 |---|---|---|
-| deposit | amount > 0; account not locked; `tx` not already a recorded deposit; no overflow | `available += amount`; record deposit as `Normal`; account created if missing |
+| deposit | amount > 0; account not locked; `(client, tx)` not already a recorded deposit; no overflow | `available += amount`; record deposit as `Normal`; account created if missing |
 | withdrawal | amount > 0; account not locked; `available >= amount` | `available -= amount`; not recorded |
-| dispute | `tx` is a recorded deposit of **this client**; state is `Normal` | `available -= amount`, `held += amount`; state `Disputed` |
-| resolve | same client; state is `Disputed` | `held -= amount`, `available += amount`; state `Normal` |
-| chargeback | same client; state is `Disputed` | `held -= amount`; state `ChargedBack`; `locked = true` |
+| dispute | `(client, tx)` is a recorded deposit; state is `Normal` | `available -= amount`, `held += amount`; state `Disputed` |
+| resolve | `(client, tx)` is a recorded deposit; state is `Disputed` | `held -= amount`, `available += amount`; state `Normal` |
+| chargeback | `(client, tx)` is a recorded deposit; state is `Disputed` | `held -= amount`; state `ChargedBack`; `locked = true` |
 
 Agreed rules and assumptions:
 
@@ -104,13 +106,17 @@ Agreed rules and assumptions:
    `ChargedBack` is terminal.
 5. Bad input never aborts the run. The row is skipped or the transaction
    rejected, a `warn` line goes to stderr, and processing continues.
-6. A dispute, resolve or chargeback whose `client` differs from the stored
-   deposit's client is rejected. This also makes cross-shard lookups
-   unnecessary.
+6. Deposits are stored and looked up by `(client, tx)`. A dispute, resolve or
+   chargeback naming a client that did not make the deposit therefore finds
+   nothing and is rejected as an unknown tx. The same key makes duplicate-id
+   detection local to one client, so results do not depend on how clients are
+   spread over workers.
 7. Dispute, resolve and chargeback never create an account. A deposit or
-   withdrawal with a valid amount does, even if the withdrawal is then rejected
-   for insufficient funds (the client exists and is reported with zero
-   balances).
+   withdrawal with a valid amount creates one if the client is new. A deposit
+   that is then rejected cannot leave a new account behind (duplicates and
+   overflow only occur for existing clients), but a withdrawal refused for
+   insufficient funds does: the client exists and is reported with zero
+   balances.
 8. Every mutation uses checked arithmetic, including `available + held`. On
    overflow the transaction is rejected.
 
@@ -211,8 +217,11 @@ Deposit and withdrawal
     system shall still output that client with `0.0000,0.0000,0.0000,false`.
 14. If a deposit or withdrawal amount is zero, then the system shall reject it
     and shall not create an account for that client.
-15. If a deposit reuses a tx id already recorded as a deposit, then the system
-    shall reject it and leave balances unchanged.
+15. If a deposit reuses a tx id already recorded as a deposit of the same
+    client, then the system shall reject it and leave balances unchanged. A
+    deposit whose tx id was used by a different client is not a duplicate: ids
+    are assumed globally unique, and the engine enforces uniqueness per client
+    only.
 
 Dispute, resolve, chargeback
 
@@ -286,6 +295,11 @@ Documentation
 - **Deposit history is unbounded in memory.** Tx ids can reach 2^32; every
   deposit costs a map entry. Deferred. Documented in the README as a known
   limit; the fix would be an external store.
+- **Tx ids are assumed globally unique.** The engine enforces uniqueness per
+  client only (keys are `(client, tx)`), because enforcing it globally would
+  need coordination between workers and make results depend on the worker
+  count. Input that reuses an id across clients is accepted for each client.
+  Resolved.
 - **Disputes on a locked account.** Assumed allowed (rule 26): freezing stops
   new money moving but does not stop dispute handling. Resolved by default,
   not yet confirmed with a reviewer.

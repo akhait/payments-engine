@@ -20,7 +20,7 @@ const SCALE: i64 = 10_i64.pow(DECIMALS as u32);
 ///
 /// The value is signed because an account's available balance can go negative
 /// after a dispute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Amount(i64);
 
 /// Why a string could not be read as an [`Amount`].
@@ -54,6 +54,14 @@ impl fmt::Display for ParseAmountError {
 impl std::error::Error for ParseAmountError {}
 
 impl Amount {
+    /// The amount zero.
+    pub const ZERO: Amount = Amount(0);
+
+    /// Returns `true` if the amount is strictly greater than zero.
+    pub fn is_positive(self) -> bool {
+        self.0 > 0
+    }
+
     /// Adds two amounts, returning `None` if the result would overflow.
     pub fn checked_add(self, rhs: Amount) -> Option<Amount> {
         self.0.checked_add(rhs.0).map(Amount)
@@ -285,6 +293,20 @@ mod tests {
     #[test]
     fn checked_sub_returns_none_when_subtracting_the_minimum_from_zero() {
         assert_eq!(Amount(0).checked_sub(Amount(i64::MIN)), None);
+    }
+
+    #[test]
+    fn default_amount_is_zero() {
+        assert_eq!(Amount::default(), Amount(0));
+        assert_eq!(Amount::ZERO, Amount::default());
+        assert_eq!(Amount::default().to_string(), "0.0000");
+    }
+
+    #[test]
+    fn is_positive_only_above_zero() {
+        assert!(Amount(1).is_positive());
+        assert!(!Amount(0).is_positive());
+        assert!(!Amount(-1).is_positive());
     }
 
     #[test]

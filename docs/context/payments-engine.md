@@ -45,3 +45,41 @@ mutants tried afterwards are killed.
 **Open**: the reviewers noted that `serde`'s `derive` feature pulls in `syn`
 3.0.10, a brand-new major version. Consider an advisory scan (`cargo audit` or
 `cargo deny`) before submitting; neither tool is installed locally.
+
+## 2026-11-14: Task 2: Engine with deposits and withdrawals
+
+**Decision**: The deposit history is keyed by `(client, tx)` instead of `tx`.
+**Reason**: With a plain `tx` key, a duplicate id across two clients is rejected
+by one engine but accepted when the clients sit in different shards, so output
+would depend on the worker count (AC 27). Both reviewers found this. A
+`(client, tx)` key keeps everything about a client in one engine, drops
+`client` from `DepositRecord`, and makes "dispute names the wrong client" fall
+out as an ordinary unknown-tx lookup (rule 6).
+**Alternatives considered**: Global uniqueness across shards. Rejected: it needs
+cross-worker coordination, and the spec already promises globally unique ids,
+so well-formed input never exercises the difference.
+
+**Decision**: The duplicate check runs before the account is created.
+**Reason**: A rejected deposit must leave nothing behind. Only a withdrawal
+refused for insufficient funds creates an account (rule 7).
+
+**Decision**: `Account` owns balance arithmetic: private fields, `credit` and
+`debit` reject non-positive amounts and check overflow. `Engine` only decides
+which rules apply.
+**Reason**: The engine's positivity check was the only guard, so any future
+caller could have credited a negative amount. The engine keeps its own check so
+that a refused amount does not create an account.
+
+**Decision**: `Account::debit` reports one error, `InsufficientFunds`, whether
+the result would be negative or would underflow.
+**Reason**: For a positive amount the two cases mean the same thing, and a
+separate overflow branch could not be reached or tested.
+
+**Decision**: `DepositRecord` and `DisputeState` were added in this task rather
+than Task 3, and `Account::credit` does not yet check `available + held`.
+**Reason**: Recording a deposit needs both types. `held` is always zero until
+disputes exist, so a total-overflow check would be untested code; Task 3 adds
+it test-first.
+
+**Open for Task 8**: do not log `{:?}` of `Engine` or `Account`. Their derived
+`Debug` prints every balance. Log only client and tx ids.
