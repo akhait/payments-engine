@@ -3,6 +3,12 @@
 Decisions made during implementation that are not obvious from the spec or the
 diff.
 
+This is the project's decision log (an ADR). Entries up to and including Task 6
+were written before the log adopted numbered entries, and are kept as written.
+From Task 7 on, entries are numbered `D1`, `D2`, ... and are append-only: a later
+decision that reverses an earlier one is a new entry, and the old one is marked
+as superseded.
+
 ## 2026-11-14: Task 1: Crate scaffold and `Amount`
 
 **Decision**: `Amount::from_str` accepts `.5` and `5.` (at least one digit

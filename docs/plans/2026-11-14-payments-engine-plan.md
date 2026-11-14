@@ -18,6 +18,23 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
   and Task 6 shares none with Tasks 3, 4 or 5. We will still run them in order
   so each piece can be explained as it lands.
 
+## Progress
+
+- [x] Task 1: Crate scaffold and `Amount` — `35edbae`
+- [x] Task 2: Engine with deposits and withdrawals — `14e870f`
+- [x] Task 3: Dispute and resolve — `61d7244`
+- [x] Task 4: Chargeback and account locking — `cad6dfe`
+- [x] Task 5: Row parsing and streaming reader — `2a842ea`
+- [x] Task 6: Output writer — `2b23831`
+- [ ] Task 7: Sequential end-to-end CLI
+- [ ] Task 8: Sharded concurrent pipeline
+- [ ] Task 9: Switch the CLI to the concurrent pipeline and failure handling
+- [ ] Task 10: README and final verification
+
+Follow-up commits that belong to finished tasks: `477aa49` (tests build amounts
+from raw units) and `acfb739` (the output writer checks totals with
+`try_for_each`).
+
 ## Tasks
 
 ### Task 1: Crate scaffold and `Amount`
@@ -129,21 +146,27 @@ held` on every row).
 
 ### Task 7: Sequential end-to-end CLI
 
-**What**: Wire reader, one `Engine` and writer into `run(path, out)` and a real
-`main`: exactly one argument (usage line on stderr and exit 2 otherwise), file
+**What**: Add `Engine::into_accounts()` so the engine can hand over its accounts.
+Wire reader, one `Engine` and writer into `run(path, out)` and a real `main`: exactly one argument (usage line on stderr and exit 2 otherwise), file
 open error to stderr and exit 1 with nothing on stdout, `tracing-subscriber`
-initialised to stderr with default filter `warn` and `RUST_LOG` override. Add
+(a runtime dependency now, `fmt` only, ANSI off) initialised to stderr with
+default filter `warn`; `RUST_LOG` may name another level (`off`, `error`,
+`warn`, `info`, `debug`, `trace`), which avoids the `env-filter` machinery and
+the crates it pulls in. Add
 small hand-written fixtures and an integration test that runs the built binary.
 This is the walking skeleton: `cargo run -- file.csv > out.csv` works, still
 single-threaded.
-**Files**: `src/main.rs`, `src/lib.rs`, `tests/cli.rs`,
-`tests/fixtures/*.csv`
+**Files**: `src/main.rs`, `src/lib.rs`, `src/engine.rs`, `Cargo.toml`,
+`Cargo.lock`, `tests/cli.rs`, `tests/fixtures/*.csv`
 **Depends on**: Tasks 4, 5, 6
 **Verify**: `cargo test --test cli` passes AC 1, 2 and 3 (stdout holds only
 CSV; no args and two args exit 2 with empty stdout; missing file exits 1 with
 empty stdout), plus fixture runs comparing output as an unordered set of rows
 (so row order does not matter). `cargo run -- tests/fixtures/basic.csv` shows
-the expected accounts.
+the expected accounts. Also checks stderr at the CLI level: a bad row is logged
+with its data-row number (the fixture has CRLF line endings and blank lines) and
+a fixed reason, never its content; a clean run logs nothing; an oversize row or
+a bad header exits 1 with an error on stderr and nothing on stdout.
 
 ### Task 8: Sharded concurrent pipeline
 
