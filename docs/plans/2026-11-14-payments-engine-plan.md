@@ -1,7 +1,7 @@
 # Payments Engine — Implementation Plan
 
 Spec: docs/specs/2026-11-14-payments-engine.md
-Workspace: current branch (main)
+Workspace: branch payments-engine (a branch-safety hook blocks commits on main)
 Jira: N/A
 
 AC numbers below refer to the numbered acceptance criteria in the spec.
@@ -35,6 +35,7 @@ binary, with a stub `main`). Add `serde` with the derive feature. Implement
 15000, `"1"` to 10000, `"0.0001"` to 1, `" 2.0 "` to 20000; reject
 `"1.00001"`, `"-1"`, `"abc"`, `"1e3"`, `""`; format 15000 as `1.5000`;
 `i64::MAX` plus 1 gives `None`). `cargo build` succeeds.
+**Status**: Complete
 
 ### Task 2: Engine with deposits and withdrawals
 
