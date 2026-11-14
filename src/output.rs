@@ -65,9 +65,9 @@ pub fn write_accounts<W: Write>(
 
     // Check every total before writing anything, so that a failure leaves the
     // output untouched instead of half a report.
-    for (client, account) in &accounts {
-        total_of(*client, account)?;
-    }
+    accounts
+        .iter()
+        .try_for_each(|(client, account)| total_of(*client, account).map(|_| ()))?;
 
     let mut writer = csv::Writer::from_writer(out);
     writer.write_record(COLUMNS)?;
