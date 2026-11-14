@@ -57,6 +57,15 @@ impl Amount {
     /// The amount zero.
     pub const ZERO: Amount = Amount(0);
 
+    /// Builds an amount from a raw count of ten-thousandths (`15_000` is `1.5`).
+    ///
+    /// Only available to tests. Production code has to go through [`FromStr`],
+    /// so that no unchecked value can enter the system.
+    #[cfg(test)]
+    pub(crate) fn from_units(units: i64) -> Amount {
+        Amount(units)
+    }
+
     /// Returns `true` if the amount is strictly greater than zero.
     pub fn is_positive(self) -> bool {
         self.0 > 0

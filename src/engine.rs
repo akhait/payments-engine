@@ -120,32 +120,22 @@ impl Engine {
 mod tests {
     use super::*;
 
-    const MAX: &str = "922337203685477.5807";
+    // Amounts are written in ten-thousandths: 10_000 is 1.0, 15_000 is 1.5.
 
-    fn amt(s: &str) -> Amount {
-        s.parse().expect("valid amount in test")
-    }
-
-    fn deposit(client: ClientId, tx: TxId, amount: &str) -> Transaction {
+    fn deposit(client: ClientId, tx: TxId, units: i64) -> Transaction {
         Transaction::Deposit {
             client,
             tx,
-            amount: amt(amount),
+            amount: Amount::from_units(units),
         }
     }
 
-    fn withdrawal(client: ClientId, tx: TxId, amount: &str) -> Transaction {
+    fn withdrawal(client: ClientId, tx: TxId, units: i64) -> Transaction {
         Transaction::Withdrawal {
             client,
             tx,
-            amount: amt(amount),
+            amount: Amount::from_units(units),
         }
-    }
-
-    fn negative(amount: &str) -> Amount {
-        Amount::ZERO
-            .checked_sub(amt(amount))
-            .expect("a small amount cannot underflow")
     }
 
     fn apply_all(engine: &mut Engine, transactions: &[Transaction]) {
@@ -156,26 +146,29 @@ mod tests {
         }
     }
 
-    fn assert_balances(
-        engine: &Engine,
-        client: ClientId,
-        available: &str,
-        held: &str,
-        total: &str,
-    ) {
+    /// Checks available and held, and that total is exactly their sum.
+    fn assert_balances(engine: &Engine, client: ClientId, available: i64, held: i64) {
         let account = engine
             .account(client)
             .unwrap_or_else(|| panic!("client {client} has no account"));
-        assert_eq!(account.available(), amt(available), "available");
-        assert_eq!(account.held(), amt(held), "held");
-        assert_eq!(account.total(), Some(amt(total)), "total");
+        assert_eq!(
+            account.available(),
+            Amount::from_units(available),
+            "available"
+        );
+        assert_eq!(account.held(), Amount::from_units(held), "held");
+        assert_eq!(
+            account.total(),
+            Some(Amount::from_units(available + held)),
+            "total"
+        );
     }
 
     #[test]
     fn deposits_increase_available_and_total() {
         let mut engine = Engine::default();
-        apply_all(&mut engine, &[deposit(1, 1, "1.0"), deposit(1, 2, "2.0")]);
-        assert_balances(&engine, 1, "3.0", "0", "3.0");
+        apply_all(&mut engine, &[deposit(1, 1, 10_000), deposit(1, 2, 20_000)]);
+        assert_balances(&engine, 1, 30_000, 0);
     }
 
     #[test]
@@ -183,9 +176,9 @@ mod tests {
         let mut engine = Engine::default();
         apply_all(
             &mut engine,
-            &[deposit(1, 1, "3.0"), withdrawal(1, 2, "1.5")],
+            &[deposit(1, 1, 30_000), withdrawal(1, 2, 15_000)],
         );
-        assert_balances(&engine, 1, "1.5", "0", "1.5");
+        assert_balances(&engine, 1, 15_000, 0);
     }
 
     #[test]
@@ -193,41 +186,56 @@ mod tests {
         let mut engine = Engine::default();
         apply_all(
             &mut engine,
-            &[deposit(1, 1, "2.0"), withdrawal(1, 2, "2.0")],
+            &[deposit(1, 1, 20_000), withdrawal(1, 2, 20_000)],
         );
-        assert_balances(&engine, 1, "0", "0", "0");
+        assert_balances(&engine, 1, 0, 0);
     }
 
     #[test]
     fn withdrawal_exceeding_available_is_rejected_and_changes_nothing() {
         let mut engine = Engine::default();
-        apply_all(&mut engine, &[deposit(2, 1, "2.0")]);
+        apply_all(&mut engine, &[deposit(2, 1, 20_000)]);
         assert_eq!(
-            engine.apply(withdrawal(2, 2, "3.0")),
+            engine.apply(withdrawal(2, 2, 30_000)),
             Err(Rejection::InsufficientFunds)
         );
-        assert_balances(&engine, 2, "2.0", "0", "2.0");
+        assert_balances(&engine, 2, 20_000, 0);
     }
 
     #[test]
     fn first_withdrawal_it_cannot_cover_still_creates_the_account() {
         let mut engine = Engine::default();
         assert_eq!(
-            engine.apply(withdrawal(7, 1, "1.0")),
+            engine.apply(withdrawal(7, 1, 10_000)),
             Err(Rejection::InsufficientFunds)
         );
-        assert_balances(&engine, 7, "0", "0", "0");
+        assert_balances(&engine, 7, 0, 0);
     }
 
     #[test]
     fn zero_amounts_are_rejected_without_creating_an_account() {
         let mut engine = Engine::default();
         assert_eq!(
-            engine.apply(deposit(1, 1, "0")),
+            engine.apply(deposit(1, 1, 0)),
             Err(Rejection::NonPositiveAmount)
         );
         assert_eq!(
-            engine.apply(withdrawal(2, 2, "0.0")),
+            engine.apply(withdrawal(2, 2, 0)),
+            Err(Rejection::NonPositiveAmount)
+        );
+        assert!(engine.account(1).is_none());
+        assert!(engine.account(2).is_none());
+    }
+
+    #[test]
+    fn negative_amounts_are_rejected_without_creating_an_account() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            engine.apply(deposit(1, 1, -10_000)),
+            Err(Rejection::NonPositiveAmount)
+        );
+        assert_eq!(
+            engine.apply(withdrawal(2, 2, -10_000)),
             Err(Rejection::NonPositiveAmount)
         );
         assert!(engine.account(1).is_none());
@@ -237,37 +245,28 @@ mod tests {
     #[test]
     fn duplicate_deposit_id_is_rejected_and_changes_nothing() {
         let mut engine = Engine::default();
-        apply_all(&mut engine, &[deposit(1, 1, "1.0")]);
+        apply_all(&mut engine, &[deposit(1, 1, 10_000)]);
         assert_eq!(
-            engine.apply(deposit(1, 1, "5.0")),
+            engine.apply(deposit(1, 1, 50_000)),
             Err(Rejection::DuplicateTransaction)
         );
-        assert_balances(&engine, 1, "1.0", "0", "1.0");
+        assert_balances(&engine, 1, 10_000, 0);
     }
 
     #[test]
     fn deposit_that_would_overflow_is_rejected_and_changes_nothing() {
         let mut engine = Engine::default();
-        apply_all(&mut engine, &[deposit(1, 1, MAX)]);
-        assert_eq!(
-            engine.apply(deposit(1, 2, "0.0001")),
-            Err(Rejection::Overflow)
-        );
-        assert_balances(&engine, 1, MAX, "0", MAX);
+        apply_all(&mut engine, &[deposit(1, 1, i64::MAX)]);
+        assert_eq!(engine.apply(deposit(1, 2, 1)), Err(Rejection::Overflow));
+        assert_balances(&engine, 1, i64::MAX, 0);
     }
 
     #[test]
     fn rejected_deposit_does_not_consume_its_tx_id() {
         let mut engine = Engine::default();
-        apply_all(&mut engine, &[deposit(1, 1, MAX)]);
-        assert_eq!(
-            engine.apply(deposit(1, 2, "0.0001")),
-            Err(Rejection::Overflow)
-        );
-        apply_all(
-            &mut engine,
-            &[withdrawal(1, 3, "1.0"), deposit(1, 2, "0.0001")],
-        );
+        apply_all(&mut engine, &[deposit(1, 1, i64::MAX)]);
+        assert_eq!(engine.apply(deposit(1, 2, 1)), Err(Rejection::Overflow));
+        apply_all(&mut engine, &[withdrawal(1, 3, 10_000), deposit(1, 2, 1)]);
     }
 
     #[test]
@@ -276,43 +275,21 @@ mod tests {
         apply_all(
             &mut engine,
             &[
-                deposit(1, 1, "5.0"),
-                deposit(2, 2, "7.0"),
-                withdrawal(1, 3, "2.0"),
+                deposit(1, 1, 50_000),
+                deposit(2, 2, 70_000),
+                withdrawal(1, 3, 20_000),
             ],
         );
-        assert_balances(&engine, 1, "3.0", "0", "3.0");
-        assert_balances(&engine, 2, "7.0", "0", "7.0");
-    }
-
-    #[test]
-    fn negative_amounts_are_rejected_without_creating_an_account() {
-        let mut engine = Engine::default();
-        let bad_deposit = Transaction::Deposit {
-            client: 1,
-            tx: 1,
-            amount: negative("1.0"),
-        };
-        let bad_withdrawal = Transaction::Withdrawal {
-            client: 2,
-            tx: 2,
-            amount: negative("1.0"),
-        };
-        assert_eq!(engine.apply(bad_deposit), Err(Rejection::NonPositiveAmount));
-        assert_eq!(
-            engine.apply(bad_withdrawal),
-            Err(Rejection::NonPositiveAmount)
-        );
-        assert!(engine.account(1).is_none());
-        assert!(engine.account(2).is_none());
+        assert_balances(&engine, 1, 30_000, 0);
+        assert_balances(&engine, 2, 70_000, 0);
     }
 
     #[test]
     fn same_tx_id_used_by_different_clients_is_not_a_duplicate() {
         let mut engine = Engine::default();
-        apply_all(&mut engine, &[deposit(1, 1, "5.0"), deposit(2, 1, "7.0")]);
-        assert_balances(&engine, 1, "5.0", "0", "5.0");
-        assert_balances(&engine, 2, "7.0", "0", "7.0");
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), deposit(2, 1, 70_000)]);
+        assert_balances(&engine, 1, 50_000, 0);
+        assert_balances(&engine, 2, 70_000, 0);
     }
 
     #[test]

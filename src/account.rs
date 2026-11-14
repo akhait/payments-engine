@@ -108,89 +108,88 @@ pub struct DepositRecord {
 mod tests {
     use super::*;
 
-    const MAX: &str = "922337203685477.5807";
-
-    fn amt(s: &str) -> Amount {
-        s.parse().expect("valid amount in test")
-    }
-
-    fn negative(s: &str) -> Amount {
-        Amount::ZERO
-            .checked_sub(amt(s))
-            .expect("a small amount cannot underflow")
-    }
+    // Amounts are written in ten-thousandths: 10_000 is 1.0, 15_000 is 1.5.
 
     #[test]
     fn new_account_is_empty_and_unlocked() {
         let account = Account::default();
-        assert_eq!(account.available(), amt("0"));
-        assert_eq!(account.held(), amt("0"));
-        assert_eq!(account.total(), Some(amt("0")));
+        assert_eq!(account.available(), Amount::ZERO);
+        assert_eq!(account.held(), Amount::ZERO);
+        assert_eq!(account.total(), Some(Amount::ZERO));
         assert!(!account.is_locked());
     }
 
     #[test]
     fn credit_increases_available_and_total() {
         let mut account = Account::default();
-        account.credit(amt("1.5")).unwrap();
-        account.credit(amt("2.25")).unwrap();
-        assert_eq!(account.available(), amt("3.75"));
-        assert_eq!(account.total(), Some(amt("3.75")));
+        account.credit(Amount::from_units(15_000)).unwrap();
+        account.credit(Amount::from_units(22_500)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(37_500));
+        assert_eq!(account.total(), Some(Amount::from_units(37_500)));
     }
 
     #[test]
     fn credit_that_would_overflow_is_rejected_and_changes_nothing() {
         let mut account = Account::default();
-        account.credit(amt(MAX)).unwrap();
-        assert_eq!(account.credit(amt("0.0001")), Err(BalanceError::Overflow));
-        assert_eq!(account.available(), amt(MAX));
+        account.credit(Amount::from_units(i64::MAX)).unwrap();
+        assert_eq!(
+            account.credit(Amount::from_units(1)),
+            Err(BalanceError::Overflow)
+        );
+        assert_eq!(account.available(), Amount::from_units(i64::MAX));
     }
 
     #[test]
     fn debit_decreases_available_and_total() {
         let mut account = Account::default();
-        account.credit(amt("3.0")).unwrap();
-        account.debit(amt("1.5")).unwrap();
-        assert_eq!(account.available(), amt("1.5"));
-        assert_eq!(account.total(), Some(amt("1.5")));
+        account.credit(Amount::from_units(30_000)).unwrap();
+        account.debit(Amount::from_units(15_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(15_000));
+        assert_eq!(account.total(), Some(Amount::from_units(15_000)));
     }
 
     #[test]
     fn debit_of_the_exact_balance_leaves_zero() {
         let mut account = Account::default();
-        account.credit(amt("2.0")).unwrap();
-        account.debit(amt("2.0")).unwrap();
-        assert_eq!(account.available(), amt("0"));
+        account.credit(Amount::from_units(20_000)).unwrap();
+        account.debit(Amount::from_units(20_000)).unwrap();
+        assert_eq!(account.available(), Amount::ZERO);
     }
 
     #[test]
     fn debit_of_more_than_available_is_rejected_and_changes_nothing() {
         let mut account = Account::default();
-        account.credit(amt("2.0")).unwrap();
+        account.credit(Amount::from_units(20_000)).unwrap();
         assert_eq!(
-            account.debit(amt("2.0001")),
+            account.debit(Amount::from_units(20_001)),
             Err(BalanceError::InsufficientFunds)
         );
-        assert_eq!(account.available(), amt("2.0"));
+        assert_eq!(account.available(), Amount::from_units(20_000));
     }
 
     #[test]
     fn credit_rejects_zero_and_negative_amounts_and_changes_nothing() {
         let mut account = Account::default();
-        account.credit(amt("5.0")).unwrap();
-        for bad in [Amount::ZERO, negative("3.0")] {
-            assert_eq!(account.credit(bad), Err(BalanceError::NonPositiveAmount));
+        account.credit(Amount::from_units(50_000)).unwrap();
+        for bad in [0, -30_000] {
+            assert_eq!(
+                account.credit(Amount::from_units(bad)),
+                Err(BalanceError::NonPositiveAmount)
+            );
         }
-        assert_eq!(account.available(), amt("5.0"));
+        assert_eq!(account.available(), Amount::from_units(50_000));
     }
 
     #[test]
     fn debit_rejects_zero_and_negative_amounts_and_changes_nothing() {
         let mut account = Account::default();
-        account.credit(amt("5.0")).unwrap();
-        for bad in [Amount::ZERO, negative("3.0")] {
-            assert_eq!(account.debit(bad), Err(BalanceError::NonPositiveAmount));
+        account.credit(Amount::from_units(50_000)).unwrap();
+        for bad in [0, -30_000] {
+            assert_eq!(
+                account.debit(Amount::from_units(bad)),
+                Err(BalanceError::NonPositiveAmount)
+            );
         }
-        assert_eq!(account.available(), amt("5.0"));
+        assert_eq!(account.available(), Amount::from_units(50_000));
     }
 }

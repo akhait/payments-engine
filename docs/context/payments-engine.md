@@ -60,8 +60,12 @@ cross-worker coordination, and the spec already promises globally unique ids,
 so well-formed input never exercises the difference.
 
 **Decision**: The duplicate check runs before the account is created.
-**Reason**: A rejected deposit must leave nothing behind. Only a withdrawal
-refused for insufficient funds creates an account (rule 7).
+**Reason**: This ordering alone protects nothing observable (review showed that
+swapping it changes no test). What actually guarantees that a rejected deposit
+leaves no account behind is the `(client, tx)` key, because a recorded deposit
+implies an existing account, together with the fact that crediting a positive
+amount to an empty account cannot fail. Task 3 will make this structural by
+writing the account and the record only after every check has passed.
 
 **Decision**: `Account` owns balance arithmetic: private fields, `credit` and
 `debit` reject non-positive amounts and check overflow. `Engine` only decides
@@ -83,3 +87,27 @@ it test-first.
 
 **Open for Task 8**: do not log `{:?}` of `Engine` or `Account`. Their derived
 `Debug` prints every balance. Log only client and tx ids.
+
+## 2026-11-14: Between Tasks 2 and 3
+
+**Decision**: Keep `Amount` as an `i64` count of ten-thousandths. Anything that
+does not fit is rejected, never widened, wrapped or clamped.
+**Reason**: The limit is about 9.2 x 10^14 currency units, far beyond a real
+balance, so overflow is a guard against garbage or hostile input and not an
+expected business path. Rejecting keeps balances correct and the client and tx
+ids are logged for reconciliation. `u64` cannot represent the negative
+`available` balance that disputes allow. `i128` would remove the case, but
+roughly doubles the deposit history, the one structure that can grow to
+billions of entries. Because `Amount` is a sealed newtype, switching later is a
+change inside `amount.rs` only.
+**To do**: state the limit in the README (Task 10).
+
+**Decision**: Tests build amounts with a test-only `Amount::from_units(i64)`
+(raw ten-thousandths) instead of parsing strings through `amt()` / `negative()`
+helpers.
+**Reason**: Simpler call sites, and negative amounts need no workaround since the
+parser rejects signs. The constructor is `#[cfg(test)]`, so production code
+still has no way to create an amount except parsing. The cost is that readers
+convert ten-thousandths (10_000 is 1.0); each test module says so at the top.
+**Alternatives considered**: making the field `pub(crate)`. Rejected, since any
+module could then bypass the checked arithmetic.
