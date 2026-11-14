@@ -27,7 +27,7 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 - [x] Task 5: Row parsing and streaming reader — `2a842ea`
 - [x] Task 6: Output writer — `2b23831`
 - [x] Task 7: Sequential end-to-end CLI — `1e12659`
-- [ ] Task 8: Sharded concurrent pipeline
+- [x] Task 8: Sharded concurrent pipeline — `a327fa2`
 - [ ] Task 9: Switch the CLI to the concurrent pipeline and failure handling
 - [ ] Task 10: README and final verification
 
@@ -170,40 +170,69 @@ a bad header exits 1 with an error on stderr and nothing on stdout.
 
 ### Task 8: Sharded concurrent pipeline
 
-**What**: Add `tokio` (rt-multi-thread, macros, sync). Implement
+**What**: Add `tokio` (`rt-multi-thread`, `sync`; `macros` and `time` are
+dev-only until Task 9). Implement
 `run_pipeline(rows: impl Iterator<Item = Result<Transaction, ReadError>> + Send + 'static, shards,
 capacity) -> Result<Vec<(ClientId, Account)>, PipelineError>`: a
 `spawn_blocking` router consumes the iterator and calls
 `Sender::blocking_send` to shard `client % shards`; each shard has a bounded
 `mpsc` channel and a worker task owning an `Engine` that loops on
-`recv().await` and logs rejections at `warn`; when senders drop the workers
-return their `Engine`s; a `collect_workers` helper joins them (mapping a
-`JoinError` to `PipelineError::WorkerPanicked`) and merges the accounts. Add a
-deterministic pseudo-random transaction generator (no extra crate) for tests.
+`recv().await` and logs rejections; when senders drop the workers
+return their `Engine`s; a `collect_workers` helper joins them (a panic is
+`PipelineError::WorkerPanicked`, any other `JoinError` is `Stopped`) and the
+accounts of all engines are concatenated. Add a deterministic pseudo-random
+transaction generator (no extra crate) for tests.
 The router stops at the first `Err` item (a failing input or an oversize row),
 lets the workers drain what they were already sent, and returns that error.
-**Files**: `Cargo.toml`, `src/pipeline.rs`, `tests/concurrency.rs`
-**Depends on**: Task 4, Task 5
+Shard and channel sizes are `NonZeroUsize`, so a zero cannot be passed, and both
+are lowered to a maximum (65,536 shards, 1,048,576 queued transactions). The
+code lives in a new `sharded` module rather than in `pipeline.rs`, which is the
+reader. A private `run_with_workers` takes a function that opens the input and
+a function that spawns each worker; it is the seam that lets tests use slow,
+panicking or early-returning workers, and the public functions wrap it.
+`run_pipeline_from_reader` opens the input (reads the header) inside the
+blocking task. A guard aborts the workers when the future is dropped, and every
+1024 transactions routed the router checks that no worker is gone. Refusal logging moves into
+a small `RefusalLog` shared by all workers (one cap of 20 lines and one summary
+whatever the shard count), and the sequential `run` uses it too;
+`Rejection::InsufficientHeld`, which means the engine's bookkeeping is broken,
+is never held back by the cap and is logged at error level (it still counts
+towards the 20). A `Transactions` stream
+that is dropped early logs its summary of skipped rows. The log-capturing test
+helper moves to a shared `test_support` module so the `RefusalLog` tests can use
+it.
+**Files**: `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/sharded.rs` (new),
+`src/refusals.rs` (new), `src/test_support.rs` (new, tests only),
+`src/pipeline.rs` (a `Drop` for `Transactions`, and tests), `tests/concurrency.rs`
+**Depends on**: Tasks 4, 5 and 7 (it uses `Engine::into_accounts` and
+`Transaction::client` and `tx`)
 **Verify**: `cargo test --test concurrency` passes AC 27 (1 worker and 8
 workers give the same accounts on a generated stream), AC 28 (10,000 interleaved
 deposit/withdrawal pairs over 100 clients on 8 workers, no withdrawal rejected
-for insufficient funds), AC 29 (capacity 1 completes without deadlock), AC 32
-(`total == available + held` for every account on every generated run).
+for insufficient funds), AC 29 (capacity 1 completes without deadlock) and AC 32
+(`total == available + held` for every account of 10 generated runs).
+`cargo test --lib sharded` passes the unit tests with stand-in workers: AC 29
+(the queue bound for several capacities), AC 30 (a panicking worker fails the
+run; the exit code, the message on stderr and the empty stdout wait for
+Task 9), AC 42 (dropping the future stops the reader) and AC 43 (a vanished
+worker stops the reader).
 
 ### Task 9: Switch the CLI to the concurrent pipeline and failure handling
 
 **What**: Make `main` a `#[tokio::main]` entry point and have `run` use
-`run_pipeline` with `shards = available_parallelism()` (minimum 1) and a
-constant channel capacity (1024). Map `PipelineError` and I/O errors to exit 1
+`run_pipeline_from_reader` with `shards = available_parallelism()` (minimum 1)
+and a constant channel capacity (1024). Map `PipelineError` and I/O errors to exit 1
 with a message on stderr and nothing written to stdout (write output only after
 the pipeline has fully succeeded).
-**Files**: `src/main.rs`, `src/lib.rs`, `src/pipeline.rs`, `tests/cli.rs`
+**Files**: `Cargo.toml` (adds the `macros` feature), `src/main.rs`,
+`src/lib.rs`, `tests/cli.rs`
 **Depends on**: Tasks 7, 8
 **Verify**: every existing `cargo test --test cli` case still passes unchanged.
-AC 30 is covered by a unit test in `pipeline.rs` that feeds `collect_workers`
-a task that panics and asserts `PipelineError::WorkerPanicked`, and a
+AC 30 is covered in Task 8 by unit tests in `sharded.rs`; Task 9 adds a
 `run`-level test that asserts the error path writes no bytes to the output
-buffer.
+buffer, and decides what the CLI does about a worker that goes away (the
+reader notices within 1024 rows) and about the runtime waiting for blocking
+threads at shutdown.
 
 ### Task 10: README and final verification
 
