@@ -334,3 +334,37 @@ security re-review):
   helpers; a reader that returns `Ok(0)` in the middle of a row would split it.
 - Moving `tracing-subscriber` into the runtime tree (Task 7) needs a fresh look:
   `env-filter` pulls in more crates, and ANSI output should stay off.
+
+## 2026-11-14: Task 6: Output writer
+
+**Decision**: `write_accounts` writes the accounts in the order it is given, and
+the order of the rows is left unspecified.
+**Reason**: The task says the order of the rows does not matter, so sorting would
+cost a pass over the accounts for no benefit, and the pipeline's merge step (Task
+8) does not have to order anything. Tests compare the rows as a set.
+
+**Decision**: Every total is checked before the header is written, and a total
+that cannot be represented fails the call with an error naming the client, with
+nothing written.
+**Reason**: A half-written report with a wrong or missing row is worse than no
+report. The `total()` of an account built through its methods always fits, so
+this is a guard that should never fire; it is tested with a test-only
+`Account::with_balances`, the same pattern as `Amount::from_units`.
+
+**Decision**: Rows are written with `csv::Writer`: no spaces after commas, `\n`
+line endings, amounts through `Amount`'s four-decimal `Display`, and negative
+amounts shown with a minus sign.
+**Reason**: The brief says spacing and the display of round values do not matter.
+A negative `available` or `total` can legitimately occur (a chargeback of a
+deposit that was already withdrawn) and the brief does not say how to show it.
+
+**Test strength**: 11 of 12 targeted mutants are killed. The survivor is
+equivalent: ignoring the error from writing the header. The csv writer buffers,
+so writing a few bytes cannot fail by itself and a failing destination is
+reported when the buffer is flushed, which is tested.
+
+**Process**: no reviewer agents for this task, as agreed: it has no rules logic.
+Inline spec check, quality gates and mutation checks only.
+
+**For Task 7**: the engine needs a way to hand over its accounts, for example
+`Engine::into_accounts()`; add it test-first there.

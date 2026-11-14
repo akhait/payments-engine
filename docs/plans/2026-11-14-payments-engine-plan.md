@@ -125,6 +125,7 @@ than a wrong number.
 **Verify**: `cargo test output` writes into a `Vec<u8>` and checks AC 31 (header,
 four decimals, `true` / `false`) and AC 32 (`total == available +
 held` on every row).
+**Status**: Complete
 
 ### Task 7: Sequential end-to-end CLI
 

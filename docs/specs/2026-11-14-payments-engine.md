@@ -167,8 +167,11 @@ Agreed rules and assumptions:
 
 ### Output
 
-- After all workers return, merge the account maps and write them with
-  `csv::Writer` to stdout, in no particular order.
+- After all workers return, merge the account maps and hand them to
+  `write_accounts`, which writes them with `csv::Writer` to stdout in the order
+  it gets them (the order of the rows is unspecified and may differ from run to
+  run). If any account's total cannot be represented,
+  nothing is written and the run fails.
 - Header `client,available,held,total,locked`; amounts via `Amount::Display`
   (four decimals); `locked` as `true` / `false`.
 

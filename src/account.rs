@@ -50,6 +50,20 @@ impl Account {
         self.available.checked_add(self.held)
     }
 
+    /// Builds an account with exactly these balances, skipping every check the
+    /// methods above make.
+    ///
+    /// Only available to tests, which sometimes need an account that real
+    /// transactions could never produce, such as one whose total overflows.
+    #[cfg(test)]
+    pub(crate) fn with_balances(available: Amount, held: Amount, locked: bool) -> Account {
+        Account {
+            available,
+            held,
+            locked,
+        }
+    }
+
     /// A locked account takes no more deposits and allows no more withdrawals.
     fn ensure_unlocked(&self) -> Result<(), BalanceError> {
         if self.locked {
