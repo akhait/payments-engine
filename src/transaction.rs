@@ -45,6 +45,31 @@ pub enum Transaction {
     },
 }
 
+impl Transaction {
+    /// The client the transaction names.
+    pub fn client(&self) -> ClientId {
+        match *self {
+            Transaction::Deposit { client, .. }
+            | Transaction::Withdrawal { client, .. }
+            | Transaction::Dispute { client, .. }
+            | Transaction::Resolve { client, .. }
+            | Transaction::Chargeback { client, .. } => client,
+        }
+    }
+
+    /// The transaction id the transaction names: its own for a deposit or
+    /// withdrawal, the deposit it refers to for the rest.
+    pub fn tx(&self) -> TxId {
+        match *self {
+            Transaction::Deposit { tx, .. }
+            | Transaction::Withdrawal { tx, .. }
+            | Transaction::Dispute { tx, .. }
+            | Transaction::Resolve { tx, .. }
+            | Transaction::Chargeback { tx, .. } => tx,
+        }
+    }
+}
+
 /// The kind of a row, as written in the input's `type` column.
 ///
 /// Matching is exact: the input uses lower case.
@@ -151,5 +176,35 @@ impl TryFrom<RawRow> for Transaction {
             RowKind::Resolve => Ok(Transaction::Resolve { client, tx }),
             RowKind::Chargeback => Ok(Transaction::Chargeback { client, tx }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_transaction_names_its_client_and_tx() {
+        let amount = Amount::from_units(10_000);
+        let transactions = [
+            Transaction::Deposit {
+                client: 1,
+                tx: 10,
+                amount,
+            },
+            Transaction::Withdrawal {
+                client: 2,
+                tx: 20,
+                amount,
+            },
+            Transaction::Dispute { client: 3, tx: 30 },
+            Transaction::Resolve { client: 4, tx: 40 },
+            Transaction::Chargeback { client: 5, tx: 50 },
+        ];
+        let named: Vec<(ClientId, TxId)> = transactions
+            .iter()
+            .map(|transaction| (transaction.client(), transaction.tx()))
+            .collect();
+        assert_eq!(named, [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]);
     }
 }

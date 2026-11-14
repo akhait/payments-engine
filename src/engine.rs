@@ -88,6 +88,11 @@ impl Engine {
         self.accounts.get(&client)
     }
 
+    /// Hands over every account, in no particular order.
+    pub fn into_accounts(self) -> impl Iterator<Item = (ClientId, Account)> {
+        self.accounts.into_iter()
+    }
+
     /// Applies one transaction, or explains why it was refused.
     pub fn apply(&mut self, transaction: Transaction) -> Result<(), Rejection> {
         match transaction {
@@ -363,6 +368,23 @@ mod tests {
         apply_all(&mut engine, &[deposit(1, 1, i64::MAX)]);
         assert_eq!(engine.apply(deposit(1, 2, 1)), Err(Rejection::Overflow));
         apply_all(&mut engine, &[withdrawal(1, 3, 10_000), deposit(1, 2, 1)]);
+    }
+
+    #[test]
+    fn into_accounts_hands_over_every_client_even_one_whose_first_withdrawal_was_refused() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(2, 1, 20_000), deposit(1, 2, 10_000)]);
+        assert_eq!(
+            engine.apply(withdrawal(7, 3, 5_000)),
+            Err(Rejection::InsufficientFunds)
+        );
+        let mut accounts: Vec<(ClientId, Account)> = engine.into_accounts().collect();
+        accounts.sort_by_key(|(client, _)| *client);
+        let clients: Vec<ClientId> = accounts.iter().map(|(client, _)| *client).collect();
+        assert_eq!(clients, [1, 2, 7]);
+        assert_eq!(accounts[0].1.available(), Amount::from_units(10_000));
+        assert_eq!(accounts[1].1.available(), Amount::from_units(20_000));
+        assert_eq!(accounts[2].1.available(), Amount::ZERO);
     }
 
     #[test]
