@@ -7,9 +7,11 @@ use crate::amount::Amount;
 pub enum BalanceError {
     /// The amount to add or remove was zero or negative.
     NonPositiveAmount,
+    /// The account is locked, so funds can no longer move in or out.
+    AccountLocked,
     /// The available balance is smaller than the amount to remove.
     InsufficientFunds,
-    /// The held balance is smaller than the amount to release.
+    /// The held balance is smaller than the amount to release or charge back.
     InsufficientHeld,
     /// The result does not fit in an [`Amount`].
     Overflow,
@@ -48,13 +50,24 @@ impl Account {
         self.available.checked_add(self.held)
     }
 
+    /// A locked account takes no more deposits and allows no more withdrawals.
+    fn ensure_unlocked(&self) -> Result<(), BalanceError> {
+        if self.locked {
+            Err(BalanceError::AccountLocked)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Adds `amount` to the available balance.
     ///
     /// Fails with [`BalanceError::NonPositiveAmount`] if `amount` is zero or
-    /// negative, or [`BalanceError::Overflow`] if the new available balance or
-    /// the new total (available plus held) does not fit.
+    /// negative, [`BalanceError::AccountLocked`] if the account is locked, or
+    /// [`BalanceError::Overflow`] if the new available balance or the new total
+    /// (available plus held) does not fit.
     pub(crate) fn credit(&mut self, amount: Amount) -> Result<(), BalanceError> {
         ensure_positive(amount)?;
+        self.ensure_unlocked()?;
         let available = self
             .available
             .checked_add(amount)
@@ -71,10 +84,11 @@ impl Account {
     /// Removes `amount` from the available balance.
     ///
     /// Fails with [`BalanceError::NonPositiveAmount`] if `amount` is zero or
-    /// negative, or [`BalanceError::InsufficientFunds`] if less than `amount`
-    /// is available.
+    /// negative, [`BalanceError::AccountLocked`] if the account is locked, or
+    /// [`BalanceError::InsufficientFunds`] if less than `amount` is available.
     pub(crate) fn debit(&mut self, amount: Amount) -> Result<(), BalanceError> {
         ensure_positive(amount)?;
+        self.ensure_unlocked()?;
         // For a positive amount, ending below zero and underflowing the
         // representation both mean the same thing: not enough funds.
         self.available = self
@@ -87,7 +101,8 @@ impl Account {
 
     /// Moves `amount` from available to held, because of a dispute.
     ///
-    /// Available may become negative; the total does not change.
+    /// Available may become negative; the total does not change. Allowed on a
+    /// locked account: the lock only stops deposits and withdrawals.
     pub(crate) fn hold(&mut self, amount: Amount) -> Result<(), BalanceError> {
         ensure_positive(amount)?;
         // Work out both new balances before storing either, so a failure on the
@@ -108,7 +123,8 @@ impl Account {
     /// Moves `amount` from held back to available, when a dispute is resolved.
     ///
     /// Fails with [`BalanceError::InsufficientHeld`] if less than `amount` is
-    /// held, so the held balance can never go negative.
+    /// held, so the held balance can never go negative. Allowed on a locked
+    /// account.
     pub(crate) fn release(&mut self, amount: Amount) -> Result<(), BalanceError> {
         ensure_positive(amount)?;
         let held = self
@@ -122,6 +138,28 @@ impl Account {
             .ok_or(BalanceError::Overflow)?;
         self.held = held;
         self.available = available;
+        Ok(())
+    }
+
+    /// Removes `amount` from the held balance for good, because of a
+    /// chargeback, and locks the account. Allowed on an account that is
+    /// already locked.
+    ///
+    /// Fails with [`BalanceError::NonPositiveAmount`] or
+    /// [`BalanceError::InsufficientHeld`]. On failure nothing changes, and in
+    /// particular the account is not locked.
+    pub(crate) fn charge_back(&mut self, amount: Amount) -> Result<(), BalanceError> {
+        ensure_positive(amount)?;
+        // `total()` stays representable because of two things that must keep
+        // holding: (a) the new held balance is at least zero (the filter below),
+        // and (b) the old total fitted, which `credit`, `hold` and `release`
+        // guarantee. The new total then lies between `available` and the old one.
+        self.held = self
+            .held
+            .checked_sub(amount)
+            .filter(|remaining| *remaining >= Amount::ZERO)
+            .ok_or(BalanceError::InsufficientHeld)?;
+        self.locked = true;
         Ok(())
     }
 }
@@ -344,5 +382,77 @@ mod tests {
         assert_eq!(account.available(), Amount::from_units(40_000));
         assert_eq!(account.held(), Amount::from_units(20_000));
         assert_eq!(account.total(), Some(Amount::from_units(60_000)));
+    }
+
+    #[test]
+    fn charge_back_removes_held_funds_and_locks_the_account() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        account.charge_back(Amount::from_units(20_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(30_000));
+        assert_eq!(account.held(), Amount::ZERO);
+        assert_eq!(account.total(), Some(Amount::from_units(30_000)));
+        assert!(account.is_locked());
+    }
+
+    #[test]
+    fn charge_back_of_more_than_held_is_rejected_and_does_not_lock() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        assert_eq!(
+            account.charge_back(Amount::from_units(20_001)),
+            Err(BalanceError::InsufficientHeld)
+        );
+        assert_eq!(account.available(), Amount::from_units(30_000));
+        assert_eq!(account.held(), Amount::from_units(20_000));
+        assert!(!account.is_locked());
+    }
+
+    #[test]
+    fn charge_back_rejects_zero_and_negative_amounts_and_does_not_lock() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        for bad in [0, -1] {
+            assert_eq!(
+                account.charge_back(Amount::from_units(bad)),
+                Err(BalanceError::NonPositiveAmount)
+            );
+        }
+        assert_eq!(account.held(), Amount::from_units(20_000));
+        assert!(!account.is_locked());
+    }
+
+    #[test]
+    fn locked_account_refuses_credit_and_debit() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        account.charge_back(Amount::from_units(20_000)).unwrap();
+        assert_eq!(
+            account.credit(Amount::from_units(10_000)),
+            Err(BalanceError::AccountLocked)
+        );
+        assert_eq!(
+            account.debit(Amount::from_units(10_000)),
+            Err(BalanceError::AccountLocked)
+        );
+        assert_eq!(account.available(), Amount::from_units(30_000));
+    }
+
+    #[test]
+    fn locked_account_still_allows_hold_and_release() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        account.hold(Amount::from_units(10_000)).unwrap();
+        account.charge_back(Amount::from_units(20_000)).unwrap();
+        assert!(account.is_locked());
+        account.release(Amount::from_units(10_000)).unwrap();
+        account.hold(Amount::from_units(5_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(25_000));
+        assert_eq!(account.held(), Amount::from_units(5_000));
     }
 }

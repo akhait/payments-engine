@@ -82,12 +82,14 @@ state becomes `ChargedBack`; account locked). Add the locked-account check to
 deposit and withdrawal (`Rejection::AccountLocked`). Dispute, resolve and
 chargeback remain allowed on a locked account for its other deposits (rule 26).
 Remove the `Unsupported` placeholder.
-**Files**: `src/engine.rs`
+**Files**: `src/engine.rs`, `src/account.rs` (adds `charge_back` and the lock
+rule)
 **Depends on**: Task 3
 **Verify**: `cargo test engine` passes AC 17 and 18 (chargeback part), AC 19
 (`ChargedBack`), AC 23 (chargeback part, and a rejected chargeback does not
 lock), AC 24, AC 25 and AC 26. For example `deposit,1,1,5.0`, `dispute,1,1`,
 `chargeback,1,1` gives `0, 0, 0, locked`, and a further deposit is rejected.
+**Status**: Complete
 
 ### Task 5: Row parsing and streaming reader
 

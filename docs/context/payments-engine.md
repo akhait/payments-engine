@@ -163,3 +163,53 @@ true.
 The spec already plans a deterministic generator; make it compare against such a
 model. Log `Rejection::InsufficientHeld` at error level (it means the engine's
 bookkeeping is broken), and still never log `{:?}` of `Engine` or `Account`.
+
+## 2026-11-14: Task 4: Chargeback and account locking
+
+**Decision**: The lock rule lives in `Account`. `credit` and `debit` return
+`AccountLocked` once the account is locked; `hold`, `release` and `charge_back`
+stay allowed.
+**Reason**: `Account` guards its own invariants, and rule 26 says freezing stops
+funds moving in or out, not dispute handling. The spec table listed "account not
+locked" among the engine's checks; the observable behaviour is the same.
+
+**Decision**: `charge_back` sets `locked` as its very last step, after the held
+check, and the engine marks the deposit `ChargedBack` only after the account
+call succeeded.
+**Reason**: A refused chargeback must not lock the account or change anything.
+Pinned by tests where another deposit is still held, so a refused chargeback
+that moved funds would be visible.
+
+**Decision**: No extra overflow check in `charge_back`.
+**Reason**: The argument sits next to the code: the new held balance is at least
+zero (the filter) and the old total fitted (guaranteed by `credit`, `hold` and
+`release`), so the new total lies between `available` and the old total. A
+reviewer checked it by exhaustive search over the real `Account` API at 8-bit
+width and by randomized comparison at full width.
+
+**Decision**: A chargeback of an already-withdrawn deposit leaves the account
+locked with negative available and total (deposit 5, withdraw 5, dispute,
+chargeback gives -5 / 0 / -5).
+**Reason**: Rule 3. Because the account is then locked, the engine cannot be
+repaid that deficit; the checked arithmetic bounds the negative value.
+
+**Decision**: Removed the `Rejection::Unsupported` placeholder.
+
+**Note**: Which rejection wins when several apply to one transaction (for
+example a duplicate deposit id on a locked account reports
+`DuplicateTransaction`) is unspecified, and tests avoid pinning it.
+
+**Test strength**: 17 of 18 targeted mutants are killed. The survivor is
+equivalent: marking the deposit `ChargedBack` before or after `charge_back`
+cannot be observed, since the engine never lets `charge_back` fail.
+
+**Carry to the README (Task 10)**, as explicit assumptions:
+1. Dispute, resolve and chargeback rows come from a trusted source. The engine
+   cannot tell who sent them, so whoever controls the feed could create a tiny
+   deposit for a client and charge it back to lock that client id for good.
+2. A lock is permanent; there is no unlock.
+3. A locked account can have a negative balance.
+4. Withdrawal ids are not recorded, so a replayed withdrawal row applies twice.
+5. A withdrawal refused for insufficient funds still creates an empty account.
+6. Tx ids are unique per client only, not globally.
+7. Balances are limited to about 9.2 x 10^14 units; larger results are refused.

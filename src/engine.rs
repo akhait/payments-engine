@@ -25,13 +25,14 @@ pub enum Rejection {
     UnknownTransaction,
     /// A dispute targeted a deposit that is already disputed or charged back.
     NotDisputable,
-    /// A resolve targeted a deposit that is not under dispute.
+    /// A resolve or chargeback targeted a deposit that is not under dispute.
     NotUnderDispute,
-    /// More held funds were to be released than the account holds. The engine
-    /// never asks for this, so seeing it means its bookkeeping is broken.
+    /// More held funds were to be released or charged back than the account
+    /// holds. The engine never asks for this, so seeing it means its
+    /// bookkeeping is broken.
     InsufficientHeld,
-    /// Chargebacks are not implemented yet.
-    Unsupported,
+    /// A deposit or withdrawal was attempted on a locked account.
+    AccountLocked,
 }
 
 impl fmt::Display for Rejection {
@@ -45,7 +46,7 @@ impl fmt::Display for Rejection {
             Self::NotDisputable => "deposit is already disputed or charged back",
             Self::NotUnderDispute => "deposit is not under dispute",
             Self::InsufficientHeld => "not enough held funds",
-            Self::Unsupported => "transaction type is not supported yet",
+            Self::AccountLocked => "account is locked",
         };
         f.write_str(message)
     }
@@ -58,6 +59,7 @@ impl From<BalanceError> for Rejection {
         match error {
             BalanceError::NonPositiveAmount => Rejection::NonPositiveAmount,
             BalanceError::InsufficientFunds => Rejection::InsufficientFunds,
+            BalanceError::AccountLocked => Rejection::AccountLocked,
             BalanceError::InsufficientHeld => Rejection::InsufficientHeld,
             BalanceError::Overflow => Rejection::Overflow,
         }
@@ -93,7 +95,7 @@ impl Engine {
             Transaction::Withdrawal { client, amount, .. } => self.withdraw(client, amount),
             Transaction::Dispute { client, tx } => self.dispute(client, tx),
             Transaction::Resolve { client, tx } => self.resolve(client, tx),
-            Transaction::Chargeback { .. } => Err(Rejection::Unsupported),
+            Transaction::Chargeback { client, tx } => self.chargeback(client, tx),
         }
     }
 
@@ -144,6 +146,17 @@ impl Engine {
         }
         account.release(record.amount)?;
         record.state = DisputeState::Normal;
+        Ok(())
+    }
+
+    fn chargeback(&mut self, client: ClientId, tx: TxId) -> Result<(), Rejection> {
+        let (account, record) = self.account_and_deposit(client, tx)?;
+        if record.state != DisputeState::Disputed {
+            return Err(Rejection::NotUnderDispute);
+        }
+        // As with a dispute, mark the deposit only after the account changed.
+        account.charge_back(record.amount)?;
+        record.state = DisputeState::ChargedBack;
         Ok(())
     }
 
@@ -208,6 +221,17 @@ mod tests {
 
     fn resolve(client: ClientId, tx: TxId) -> Transaction {
         Transaction::Resolve { client, tx }
+    }
+
+    fn chargeback(client: ClientId, tx: TxId) -> Transaction {
+        Transaction::Chargeback { client, tx }
+    }
+
+    fn is_locked(engine: &Engine, client: ClientId) -> bool {
+        engine
+            .account(client)
+            .unwrap_or_else(|| panic!("client {client} has no account"))
+            .is_locked()
     }
 
     fn apply_all(engine: &mut Engine, transactions: &[Transaction]) {
@@ -571,6 +595,7 @@ mod tests {
                 Rejection::InsufficientFunds,
             ),
             (BalanceError::InsufficientHeld, Rejection::InsufficientHeld),
+            (BalanceError::AccountLocked, Rejection::AccountLocked),
             (BalanceError::Overflow, Rejection::Overflow),
         ];
         for (error, expected) in cases {
@@ -579,12 +604,244 @@ mod tests {
     }
 
     #[test]
-    fn chargeback_is_not_supported_yet() {
+    fn chargeback_removes_the_held_funds_and_locks_the_account() {
         let mut engine = Engine::default();
-        assert_eq!(
-            engine.apply(Transaction::Chargeback { client: 1, tx: 1 }),
-            Err(Rejection::Unsupported)
+        apply_all(
+            &mut engine,
+            &[deposit(1, 1, 50_000), dispute(1, 1), chargeback(1, 1)],
         );
+        assert_balances(&engine, 1, 0, 0);
+        assert!(is_locked(&engine, 1));
+    }
+
+    #[test]
+    fn chargeback_only_removes_the_charged_back_deposit() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                deposit(1, 2, 30_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+            ],
+        );
+        assert_balances(&engine, 1, 30_000, 0);
+        assert!(is_locked(&engine, 1));
+    }
+
+    #[test]
+    fn chargeback_of_an_already_withdrawn_deposit_leaves_a_negative_balance() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                withdrawal(1, 2, 50_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+            ],
+        );
+        assert_balances(&engine, 1, -50_000, 0);
+        assert!(is_locked(&engine, 1));
+    }
+
+    #[test]
+    fn chargeback_of_a_deposit_not_under_dispute_is_rejected_and_does_not_lock() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000)]);
+        assert_eq!(
+            engine.apply(chargeback(1, 1)),
+            Err(Rejection::NotUnderDispute)
+        );
+        assert_balances(&engine, 1, 50_000, 0);
+        assert!(!is_locked(&engine, 1));
+    }
+
+    #[test]
+    fn chargeback_of_an_unknown_tx_or_wrong_client_is_rejected_and_changes_nothing() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                dispute(1, 1),
+                deposit(2, 2, 50_000),
+                dispute(2, 2),
+            ],
+        );
+        for transaction in [chargeback(1, 9), chargeback(2, 1), chargeback(7, 7)] {
+            assert_eq!(
+                engine.apply(transaction),
+                Err(Rejection::UnknownTransaction)
+            );
+        }
+        assert_balances(&engine, 1, 0, 50_000);
+        assert_balances(&engine, 2, 0, 50_000);
+        assert!(!is_locked(&engine, 1));
+        assert!(!is_locked(&engine, 2));
+        assert!(engine.account(7).is_none());
+    }
+
+    #[test]
+    fn a_charged_back_deposit_is_final() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[deposit(1, 1, 50_000), dispute(1, 1), chargeback(1, 1)],
+        );
+        assert_eq!(engine.apply(dispute(1, 1)), Err(Rejection::NotDisputable));
+        assert_eq!(engine.apply(resolve(1, 1)), Err(Rejection::NotUnderDispute));
+        assert_eq!(
+            engine.apply(chargeback(1, 1)),
+            Err(Rejection::NotUnderDispute)
+        );
+        assert_balances(&engine, 1, 0, 0);
+    }
+
+    #[test]
+    fn locked_account_rejects_deposits_and_withdrawals() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                deposit(1, 2, 30_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+            ],
+        );
+        // 30_000 is available, so only the lock can be the reason for refusing.
+        assert_eq!(
+            engine.apply(deposit(1, 3, 10_000)),
+            Err(Rejection::AccountLocked)
+        );
+        assert_eq!(
+            engine.apply(withdrawal(1, 4, 10_000)),
+            Err(Rejection::AccountLocked)
+        );
+        assert_balances(&engine, 1, 30_000, 0);
+        // The refused deposit left no record behind.
+        assert_eq!(
+            engine.apply(dispute(1, 3)),
+            Err(Rejection::UnknownTransaction)
+        );
+    }
+
+    #[test]
+    fn locked_account_still_handles_disputes_for_its_other_deposits() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                deposit(1, 2, 30_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+            ],
+        );
+        apply_all(&mut engine, &[dispute(1, 2)]);
+        assert_balances(&engine, 1, 0, 30_000);
+        apply_all(&mut engine, &[resolve(1, 2)]);
+        assert_balances(&engine, 1, 30_000, 0);
+        apply_all(&mut engine, &[dispute(1, 2), chargeback(1, 2)]);
+        assert_balances(&engine, 1, 0, 0);
+        assert!(is_locked(&engine, 1));
+    }
+
+    #[test]
+    fn rejected_chargeback_does_not_touch_other_held_funds_or_lock() {
+        let mut engine = Engine::default();
+        // Deposit 2 is disputed and holds enough to cover deposit 1, which is not.
+        apply_all(
+            &mut engine,
+            &[deposit(1, 1, 50_000), deposit(1, 2, 50_000), dispute(1, 2)],
+        );
+        assert_eq!(
+            engine.apply(chargeback(1, 1)),
+            Err(Rejection::NotUnderDispute)
+        );
+        assert_balances(&engine, 1, 50_000, 50_000);
+        assert!(!is_locked(&engine, 1));
+    }
+
+    #[test]
+    fn rejected_chargeback_of_a_charged_back_deposit_does_not_touch_other_held_funds() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                deposit(1, 2, 50_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+                dispute(1, 2),
+            ],
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+        assert_eq!(
+            engine.apply(chargeback(1, 1)),
+            Err(Rejection::NotUnderDispute)
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+    }
+
+    #[test]
+    fn locked_account_refuses_deposits_whatever_its_balances() {
+        let mut engine = Engine::default();
+        // Client 1 ends locked with negative available funds.
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                withdrawal(1, 2, 50_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+            ],
+        );
+        // Client 2 ends locked with exactly zero available funds.
+        apply_all(
+            &mut engine,
+            &[deposit(2, 1, 50_000), dispute(2, 1), chargeback(2, 1)],
+        );
+        // Client 3 ends locked while another deposit is still held.
+        apply_all(
+            &mut engine,
+            &[
+                deposit(3, 1, 50_000),
+                deposit(3, 2, 30_000),
+                dispute(3, 1),
+                dispute(3, 2),
+                chargeback(3, 1),
+            ],
+        );
+        for client in [1, 2, 3] {
+            assert!(is_locked(&engine, client));
+            assert_eq!(
+                engine.apply(deposit(client, 9, 10_000)),
+                Err(Rejection::AccountLocked)
+            );
+        }
+        assert_balances(&engine, 1, -50_000, 0);
+        assert_balances(&engine, 2, 0, 0);
+        assert_balances(&engine, 3, 0, 30_000);
+    }
+
+    #[test]
+    fn locking_one_client_does_not_affect_another() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                dispute(1, 1),
+                chargeback(1, 1),
+                deposit(2, 2, 70_000),
+                withdrawal(2, 3, 20_000),
+            ],
+        );
+        assert_balances(&engine, 2, 50_000, 0);
+        assert!(!is_locked(&engine, 2));
     }
 
     #[test]
@@ -610,10 +867,7 @@ mod tests {
             ),
             (Rejection::NotUnderDispute, "deposit is not under dispute"),
             (Rejection::InsufficientHeld, "not enough held funds"),
-            (
-                Rejection::Unsupported,
-                "transaction type is not supported yet",
-            ),
+            (Rejection::AccountLocked, "account is locked"),
         ];
         for (rejection, message) in cases {
             assert_eq!(rejection.to_string(), message);
