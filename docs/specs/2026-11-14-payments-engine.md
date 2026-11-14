@@ -178,7 +178,8 @@ Agreed rules and assumptions:
 ### Errors and logging
 
 - `tracing` + `tracing-subscriber` writing to **stderr** only; default filter
-  `warn`, overridable with `RUST_LOG`. Stdout carries nothing but the CSV.
+  `warn`, overridable with `RUST_LOG`, which names one level (`off`, `error`, `warn`,
+  `info`, `debug`, `trace`). Stdout carries nothing but the CSV.
 - Exit codes: `0` success; `1` runtime failure (file cannot be opened, I/O
   error, worker panic); `2` usage error.
 - A worker panic surfaces as a `JoinError`. The run fails with a message on
@@ -323,6 +324,15 @@ Reader robustness
 39. When the header names columns besides the four required ones, the system
     shall still accept rows that stop before them, such as a dispute without an
     amount.
+
+Command line
+
+40. When the engine refuses a transaction, the system shall log a warning with
+    the client id, the tx id and a fixed reason, the first 20 refusals one by
+    one and then one summary with the total, and shall carry on. The summary is
+    also logged when the run ends in an error.
+41. The system shall exit with the same code whether or not stderr can be
+    written.
 
 ## Out of Scope
 

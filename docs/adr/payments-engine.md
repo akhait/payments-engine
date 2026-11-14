@@ -374,3 +374,52 @@ Inline spec check, quality gates and mutation checks only.
 
 **For Task 7**: the engine needs a way to hand over its accounts, for example
 `Engine::into_accounts()`; add it test-first there.
+
+## D1 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: `RUST_LOG` names a single level (`off`, `error`, `warn`, `info`, `debug`, `trace`, in any case); numbers and per-target directives are not accepted.
+**Reason**: It keeps `env-filter` and its regex crates out of the runtime tree, and tracing's own parser accepts `0` to `5` and `+3` and reads an empty string as `error`.
+**Alternatives considered**: `EnvFilter` (more dependencies for directives nobody needs here) and `LevelFilter::from_str` (the surprises above).
+
+## D2 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: Usage messages, fatal errors and notices go through a helper that ignores write failures, and tracing's `log_internal_errors` is off.
+**Reason**: `eprintln!` panics on a closed stderr, which replaced exit codes 1 and 2 by 101; two reviewers reproduced it with a pipe nobody reads.
+**Alternatives considered**: Leaving the defaults, which made the exit code depend on whether stderr could be written.
+
+## D3 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: `run` writes the report only after the whole input was read; a failure while writing can still leave part of the report on stdout.
+**Reason**: A report built from half an input looks right but is wrong, while bytes already written to stdout cannot be taken back.
+**Alternatives considered**: Building the whole report in memory first, which cannot prevent a short write either.
+
+## D4 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: A refused transaction is logged with its client id, tx id and a fixed reason, the first 20 individually and then one summary count, which is also logged when the run ends in an error.
+**Reason**: It is the same flood protection as for skipped rows (2 million refused withdrawals gave 21 lines), and the summary matters most when something went wrong.
+**Alternatives considered**: One line per refusal.
+
+## D5 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: `tracing-subscriber` 0.3.23 with only the `fmt` and `std` features is a runtime dependency.
+**Reason**: The binary needs it, and without `ansi`, `env-filter` and `tracing-log` only five small crates join the runtime tree, all checked against RustSec (the ANSI log-poisoning advisory is fixed from 0.3.20).
+**Alternatives considered**: A hand-written logger, which is more code to maintain.
+
+## D6 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: These limits of the command line are accepted and documented: a closed or read-only stdout gives exit code 0 with no report; `-h` and `--help` are taken as file names; opening a FIFO with no writer blocks; there is no time or byte budget per input; the `RUST_LOG` value is echoed in full in the notice about it.
+**Reason**: Rust's standard library treats a closed stdout as success and detecting it would need `unsafe`, which the crate forbids; the brief defines no flags; the rest are concerns of a network front end, not of a batch tool.
+**Alternatives considered**: Duplicating stdout's file descriptor to surface the error (not tried, needs platform code), and a `--help` flag (outside the brief).
+
+## D7 — 2026-11-14 — Task 7: Sequential end-to-end CLI
+
+**Status**: Accepted
+**Decision**: The CRLF variant of the messy fixture is generated at test time from the LF file.
+**Reason**: Git can rewrite line endings in committed files, which would silently turn the CRLF test into a second LF test.
+**Alternatives considered**: Committing a CRLF file.

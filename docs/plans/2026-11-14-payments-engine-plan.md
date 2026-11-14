@@ -26,7 +26,7 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 - [x] Task 4: Chargeback and account locking — `cad6dfe`
 - [x] Task 5: Row parsing and streaming reader — `2a842ea`
 - [x] Task 6: Output writer — `2b23831`
-- [ ] Task 7: Sequential end-to-end CLI
+- [x] Task 7: Sequential end-to-end CLI — `1e12659`
 - [ ] Task 8: Sharded concurrent pipeline
 - [ ] Task 9: Switch the CLI to the concurrent pipeline and failure handling
 - [ ] Task 10: README and final verification
@@ -147,7 +147,7 @@ held` on every row).
 ### Task 7: Sequential end-to-end CLI
 
 **What**: Add `Engine::into_accounts()` so the engine can hand over its accounts.
-Wire reader, one `Engine` and writer into `run(path, out)` and a real `main`: exactly one argument (usage line on stderr and exit 2 otherwise), file
+Wire reader, one `Engine` and writer into `run(input, output)` and a real `main`: exactly one argument (usage line on stderr and exit 2 otherwise), file
 open error to stderr and exit 1 with nothing on stdout, `tracing-subscriber`
 (a runtime dependency now, `fmt` only, ANSI off) initialised to stderr with
 default filter `warn`; `RUST_LOG` may name another level (`off`, `error`,
