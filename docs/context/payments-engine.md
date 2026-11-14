@@ -213,3 +213,124 @@ cannot be observed, since the engine never lets `charge_back` fail.
 5. A withdrawal refused for insufficient funds still creates an empty account.
 6. Tx ids are unique per client only, not globally.
 7. Balances are limited to about 9.2 x 10^14 units; larger results are refused.
+
+## 2026-11-14: Task 5: Row parsing and streaming reader
+
+**Decision**: `read_transactions` yields `Result<Transaction, ReadError>`. Bad
+rows never appear as items: they are logged and skipped inside the iterator. Only
+a failing input, or a row over the size limit, is yielded as an error, once, and
+then the stream ends. Rows are read with `read_record` plus
+`StringRecord::deserialize` (not `deserialize()`) to get row numbers.
+
+**Decision**: Quoting is switched off.
+**Reason**: Both reviewers showed that one stray `"` made the reader merge every
+following row into one record: one warning, silently lost valid rows, and memory
+that grew with the file (about 200 MB for a 70 MB file against 2 MB when clean).
+Every field is a keyword or a number, so nothing needs quotes. The price: a
+quoted field such as `"deposit"` is now a bad row, skipped with a warning.
+**Alternatives considered**: keep quoting and bound the record size. More code,
+and it would still let a stray quote swallow rows up to the bound.
+
+**Decision**: A small `RowLimit` reader wrapper fails the stream once a row passes
+1024 bytes, and retries interrupted reads.
+**Reason**: The csv crate has no size limit. A single endless line cost about 3x
+its size in memory, a line of commas about 25x. The error text is fixed and holds
+no input. Rows already read are still delivered before the error. It also
+protects the header line.
+
+**Decision**: Only the first 20 skipped rows are logged, then one summary with the
+total. There is no abort after too many bad rows.
+**Reason**: One warning per bad row produced about 70x the input in log output.
+Aborting would contradict rule 5 (bad input never aborts the run).
+
+**Decision**: The logged number is the data-row index (`Position::record`), not a
+line number.
+**Reason**: csv takes the line position before skipping blank lines and before it
+consumes the `\n` of a `\r\n`, so line numbers were one or more too low on CRLF or
+blank-line input. Found in review because logging was not tested; it is now
+tested by capturing the log output with LF, CRLF, blank lines and a bad UTF-8 row.
+
+**Decision**: `client` and `tx` accept ASCII digits only; a row with more fields
+than the header is bad; the header must name `type`, `client`, `tx` and `amount`
+exactly once each (case sensitive, any order, extra columns ignored). Completely
+empty input is accepted and gives no transactions.
+**Reason**: csv's integer parsing accepts `+1` and `0x10` (one client, several
+spellings). An extra field such as a decimal comma (`1,5`) would have credited 1
+and dropped the 5 silently. A missing or differently cased header used to
+"succeed" with every row skipped.
+
+**Decision**: Log lines carry a row number and a fixed reason, never row content
+(tested with marker text in the bad fields).
+
+**Decision**: `tracing` is used without its default features, and
+`tracing-subscriber` is a dev-dependency used only to capture logs in tests.
+**Reason**: Dropping the default features removes a proc-macro crate and a second
+`syn`. Task 7 needs `tracing-subscriber` for real: move it to the normal
+dependencies with the `env-filter` feature, at version 0.3.20 or later
+(RUSTSEC-2025-0055, ANSI escape log poisoning, is fixed from 0.3.20; 0.3.23 is
+locked).
+
+**Known limits**: A truncated final row is read as complete. `Trim::All` makes csv copy
+each record, so the buffer is not allocation-free (memory is bounded by the row
+limit, not by reuse). The reader is blocking.
+
+**Test strength**: 45 of 47 targeted mutants are killed. The 2 survivors are
+equivalent: the empty-id check (parsing an empty string fails anyway) and the
+`serde(default)` on `amount` (serde already defaults an `Option` to `None`).
+`csv` itself latches an I/O error and then reports end of input, so the explicit
+`finished` flag after an I/O error is redundant for this csv version; it stays so
+our contract does not depend on it.
+
+**Carry to the README (Task 10)**: add to the assumptions: quoted CSV is not
+supported; the header is required and strict; a row over 1 KiB aborts the run; a
+final row without a line ending is accepted; warnings are capped at 20 plus a
+summary.
+
+### Task 5 after the re-review
+
+**Correction**: I first wrote that a byte order mark split across reads "fails
+loudly". That held for 1 or 2 byte splits only. If the mark arrived as its own
+3-byte read, csv took it for the end of the input and the whole stream read as
+empty, with exit code 0 and no log line, because empty input is allowed.
+**Decision**: A small `SkipBom` wrapper collects the first three bytes before
+anything is passed on and drops a mark itself. The mark then also no longer
+counts towards the row limit. Tests deliver the input in 9 different read sizes.
+
+**Decision**: A row shorter than the header is padded with empty fields before it
+is parsed.
+**Reason**: csv's deserializer needs a field for every header column, so with a
+header such as `type,client,tx,amount,note` every `dispute,1,1` was dropped,
+silently losing disputes and chargebacks. A required field that was missing
+becomes an empty one and still fails to parse; an empty amount means none.
+
+**Decision**: The log-capturing tests use one subscriber installed once for the
+whole test process, with a separate buffer per thread.
+**Reason**: With a subscriber scoped to one thread, `cargo test` failed in about
+5% of runs (50 in 800): tracing remembers "nobody is listening" for a log call
+site when another test thread reaches it first, and the scoped subscriber then
+sometimes misses events. Now 0 failures in 300 runs (200 default, 100 at 32
+threads).
+
+**Test strength after the re-review**: the limit is checked with reads of 1, 2,
+3, 4, 59, 1023, 1024, 1025 and 4096 bytes. A per-read reset of the row counter
+(which would let a hostile row slip past the cap in small reads) is caught, and
+so are the 1024 and 20 literals, the summary after an error, the `tx` header and
+the log reason. The retry of an interrupted read is checked both at the start of
+the input and in the middle of it, because the BOM wrapper otherwise absorbs the
+first one.
+
+**Known limits of the design, for the README and any network front end** (from the
+security re-review):
+- No time or byte budget per stream. A sender of endless line endings, or one
+  byte per second, holds its blocking thread; a front end needs idle and total
+  timeouts.
+- The log cap is per stream, not per process, and the summary is not logged if
+  the caller drops the iterator early.
+- A truncated final row is read as complete, so a dropped connection can turn
+  `...,100.0` into `...,1`. A front end must require a final line ending.
+- A trailing comma on every row is rejected as an extra field; leading zeros in
+  ids are accepted (they give the same number).
+- A reader that returns `Interrupted` forever would spin, as with std's own
+  helpers; a reader that returns `Ok(0)` in the middle of a row would split it.
+- Moving `tracing-subscriber` into the runtime tree (Task 7) needs a fresh look:
+  `env-filter` pulls in more crates, and ANSI output should stay off.

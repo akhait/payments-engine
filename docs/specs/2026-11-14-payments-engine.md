@@ -104,8 +104,11 @@ Agreed rules and assumptions:
    the funding deposit). `held` is never negative by construction.
 4. A resolved deposit returns to `Normal` and may be disputed again.
    `ChargedBack` is terminal.
-5. Bad input never aborts the run. The row is skipped or the transaction
-   rejected, a `warn` line goes to stderr, and processing continues.
+5. Bad rows and refused transactions never abort the run: the row is skipped or
+   the transaction rejected, a `warn` line goes to stderr (capped, see the
+   reader), and processing continues. Only input that cannot be read at all, a
+   header that lacks a required column, or a row longer than 1024 bytes ends the
+   run, with an error.
 6. Deposits are stored and looked up by `(client, tx)`. A dispute, resolve or
    chargeback naming a client that did not make the deposit therefore finds
    nothing and is rejected as an unknown tx. The same key makes duplicate-id
@@ -122,16 +125,39 @@ Agreed rules and assumptions:
 
 ### Reader / router (Tokio layer)
 
-- `csv::ReaderBuilder` with `trim(Trim::All)` and `flexible(true)` (dispute,
-  resolve and chargeback rows omit the trailing amount column). `amount` is
-  `Option<Amount>` with `#[serde(default)]`.
-- Rows are iterated with `deserialize()`, so only one record is in memory at a
-  time.
+- `csv::ReaderBuilder` with `trim(Trim::All)`, `flexible(true)` (dispute,
+  resolve and chargeback rows omit the trailing amount column) and
+  `quoting(false)`: every field is a keyword or a number, so none needs
+  quoting, and without quote handling a bad row stays one line instead of a
+  stray quote pulling the following rows into one record. A quoted field is
+  therefore a bad row. `amount` is `Option<Amount>`; `client` and `tx` accept
+  ASCII digits only.
+- The header must name `type`, `client`, `tx` and `amount` exactly once each,
+  in any order (case sensitive, other columns ignored); otherwise reading fails
+  with an error naming the column. Input with nothing at all in it is not an
+  error.
+- A UTF-8 byte order mark at the start is skipped by a small wrapper that first
+  collects three bytes (the csv crate only strips it when it arrives within the
+  first read, so a mark delivered alone made the whole input look empty). A row
+  shorter than the header is padded with empty fields before parsing, because
+  the csv deserializer wants a field for every header column; a required field
+  that was missing then becomes an empty one and still fails.
+- Rows are read one at a time with `read_record` and `StringRecord::deserialize`
+  through a `RowLimit` wrapper. It fails the stream with an error as soon as a
+  row exceeds 1024 bytes (`MAX_ROW_BYTES`; a valid row is about 60 bytes),
+  because the csv crate has no limit of its own and would buffer a hostile
+  endless row. The wrapper also retries interrupted reads. A row with more
+  fields than the header is a bad row, since the extra fields would be dropped
+  silently.
 - `csv` is blocking, so the reader runs inside `tokio::task::spawn_blocking`
   and hands rows over with `Sender::blocking_send`. A blocking read on an async
   worker thread would stall other tasks.
-- A deserialize error on a row: warn with the row number, skip. An I/O error
-  while reading: abort the run with a non-zero exit.
+- A bad row: warn with its row number (counting data rows from 1, header and
+  blank lines excluded) and a fixed reason, never the row's content, then skip
+  it. Only the first 20 skips are logged one by one; after that they are
+  counted, and one summary with the total is logged when the stream ends. An
+  I/O error, or a row over the size limit, ends the stream with an error that
+  aborts the run with a non-zero exit.
 - Channels are bounded (constant capacity, e.g. 1024 per worker). When a worker
   is slow its channel fills and `send` suspends the reader (backpressure), so
   memory stays flat regardless of file size.
@@ -190,9 +216,10 @@ CLI and input
 5. When a dispute, resolve or chargeback row has no trailing amount field
    (`dispute,1,1`), the system shall parse it successfully.
 6. If a row has an unknown type, a client outside 0..=65535, a tx outside
-   0..=4294967295, a non-numeric field, a missing amount on a deposit or
-   withdrawal, a negative amount, or an amount with more than four decimal
-   places, then the system shall log a warning containing the row number, skip
+   0..=4294967295, a non-numeric field, an id that is not plain digits (such as
+   `+1` or `0x10`), more fields than the header names, a quoted field, a
+   missing amount on a deposit or withdrawal, a negative amount, or an amount
+   with more than four decimal places, then the system shall log a warning containing the row number, skip
    the row, and continue.
 
 Amount
@@ -278,6 +305,22 @@ Documentation
 33. The README shall document the assumptions above, the architecture, the
     test strategy and the error-handling choices.
 
+Reader robustness
+
+34. If the header lacks one of the columns `type`, `client`, `tx` and `amount`,
+    or repeats one, then reading shall fail with an error naming the column.
+    The columns may come in any order.
+35. If a single row is longer than 1024 bytes, then the system shall process the
+    rows before it, then stop reading with an error.
+36. While the input contains many bad rows, the system shall log the first 20
+    individually and then only one summary with the total count.
+37. The system shall never put the content of a skipped row in a log line.
+38. If the input starts with a UTF-8 byte order mark, then the system shall
+    ignore it, however the first reads of the input are split.
+39. When the header names columns besides the four required ones, the system
+    shall still accept rows that stop before them, such as a dispute without an
+    amount.
+
 ## Out of Scope
 
 - Disputing withdrawals.
@@ -310,11 +353,15 @@ Documentation
   `csv-async`) would replace it. Deferred.
 - **Ordering across multiple streams.** With several concurrent inputs, order
   is only defined per stream. Deferred, relevant only to the server scenario.
-- **Warning volume.** A file full of bad rows produces one stderr line each.
-  Accepted.
-- **Unchecked claim to verify early:** a missing trailing field really
-  deserializes to `None` with `flexible(true)` and a header row. Needs a first
-  failing test (AC 5).
+- **Warning volume.** Capped per stream: the first 20 skipped rows are logged,
+  then one summary line (AC 36). The cap is per stream, not per process.
+- **Quoted CSV is not supported.** A quoted field is a bad row and is skipped
+  with a warning. Accepted: the format has no field that needs quoting, and
+  quote handling lets one stray quote swallow the rows after it.
+- **A truncated final row is accepted.** Input that stops in the middle of a
+  row, without a final line ending, is read as if the row were complete; CSV
+  cannot tell the difference. Fine for a file; a network front end would need
+  to require a final line ending.
 - No feature flag: this is a standalone CLI with no rollout.
 
 ## Testing

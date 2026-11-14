@@ -107,6 +107,11 @@ fields and header), AC 5 (`dispute,1,1` with no amount field), and AC 6 (unknown
 type, client 70000, tx 4294967296, negative amount, five decimals, missing
 amount on a deposit are each skipped while the following valid row still
 arrives).
+**Status**: Complete
+**Delivered as**: `read_transactions(reader) -> Result<Transactions<R>,
+ReadError>`, an iterator of `Result<Transaction, ReadError>`, with quoting off, a
+header check, a 1 KiB row limit, a byte order mark wrapper and capped logging.
+See the spec (Reader / router) and the decision log.
 
 ### Task 6: Output writer
 
@@ -142,7 +147,7 @@ the expected accounts.
 ### Task 8: Sharded concurrent pipeline
 
 **What**: Add `tokio` (rt-multi-thread, macros, sync). Implement
-`run_pipeline(rows: impl Iterator<Item = Transaction> + Send + 'static, shards,
+`run_pipeline(rows: impl Iterator<Item = Result<Transaction, ReadError>> + Send + 'static, shards,
 capacity) -> Result<Vec<(ClientId, Account)>, PipelineError>`: a
 `spawn_blocking` router consumes the iterator and calls
 `Sender::blocking_send` to shard `client % shards`; each shard has a bounded
@@ -151,6 +156,8 @@ capacity) -> Result<Vec<(ClientId, Account)>, PipelineError>`: a
 return their `Engine`s; a `collect_workers` helper joins them (mapping a
 `JoinError` to `PipelineError::WorkerPanicked`) and merges the accounts. Add a
 deterministic pseudo-random transaction generator (no extra crate) for tests.
+The router stops at the first `Err` item (a failing input or an oversize row),
+lets the workers drain what they were already sent, and returns that error.
 **Files**: `Cargo.toml`, `src/pipeline.rs`, `tests/concurrency.rs`
 **Depends on**: Task 4, Task 5
 **Verify**: `cargo test --test concurrency` passes AC 27 (1 worker and 8
