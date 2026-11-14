@@ -5,6 +5,10 @@ pub mod amount;
 pub mod engine;
 pub mod output;
 pub mod pipeline;
+mod refusals;
+pub mod sharded;
+#[cfg(test)]
+mod test_support;
 pub mod transaction;
 
 use std::fmt;
@@ -15,10 +19,7 @@ use tracing::level_filters::LevelFilter;
 use crate::engine::Engine;
 use crate::output::{WriteError, write_accounts};
 use crate::pipeline::{ReadError, read_transactions};
-
-/// How many refused transactions are logged one by one. The rest are counted,
-/// so a hostile input cannot flood the log.
-const MAX_LOGGED_REJECTIONS: u64 = 20;
+use crate::refusals::RefusalLog;
 
 /// The log level when `RUST_LOG` does not name one.
 pub const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::WARN;
@@ -56,28 +57,22 @@ impl std::error::Error for RunError {
 /// engine refuses is logged and does not stop the run.
 pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), RunError> {
     let mut engine = Engine::default();
-    let mut rejected = 0u64;
-    let read = apply_all(input, &mut engine, &mut rejected);
-    if rejected > 0 {
-        tracing::warn!(rejected, "transactions rejected in total");
-    }
+    let refusals = RefusalLog::default();
+    let read = apply_all(input, &mut engine, &refusals);
+    refusals.log_summary();
     read.map_err(RunError::Read)?;
     write_accounts(output, engine.into_accounts()).map_err(RunError::Write)
 }
 
-fn apply_all<R: Read>(input: R, engine: &mut Engine, rejected: &mut u64) -> Result<(), ReadError> {
+fn apply_all<R: Read>(
+    input: R,
+    engine: &mut Engine,
+    refusals: &RefusalLog,
+) -> Result<(), ReadError> {
     for item in read_transactions(input)? {
         let transaction = item?;
         if let Err(reason) = engine.apply(transaction) {
-            *rejected += 1;
-            if *rejected <= MAX_LOGGED_REJECTIONS {
-                tracing::warn!(
-                    client = transaction.client(),
-                    tx = transaction.tx(),
-                    %reason,
-                    "transaction rejected"
-                );
-            }
+            refusals.record(&transaction, reason);
         }
     }
     Ok(())

@@ -309,6 +309,16 @@ impl<R: Read> Transactions<R> {
     }
 }
 
+/// A caller that gives up early, for instance because a worker is gone, still
+/// gets to know how many rows were skipped before that.
+impl<R: Read> Drop for Transactions<R> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish();
+        }
+    }
+}
+
 impl<R: Read> Iterator for Transactions<R> {
     type Item = Result<Transaction, ReadError>;
 
@@ -346,13 +356,13 @@ fn row_of(position: Option<&csv::Position>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::io::{self, Read, Write};
+    use std::io::{self, Read};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Once};
 
     use super::*;
     use crate::amount::Amount;
+    use crate::test_support::capture_logs;
     use crate::transaction::{ClientId, TxId};
 
     // Amounts are written in ten-thousandths: 10_000 is 1.0, 15_000 is 1.5.
@@ -385,51 +395,6 @@ mod tests {
 
     fn read(input: &str) -> Vec<Transaction> {
         read_bytes(input.as_bytes())
-    }
-
-    thread_local! {
-        /// What the current thread has logged since `capture_logs` last cleared it.
-        static LOGGED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Sends log output to the buffer of the thread that produced it.
-    struct ThreadWriter;
-
-    impl Write for ThreadWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            LOGGED.with(|logged| logged.borrow_mut().extend_from_slice(buf));
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Runs `run` and returns its result together with what it logged at warn
-    /// level.
-    ///
-    /// One subscriber is installed for the whole test process and each thread
-    /// gets its own buffer. A subscriber scoped to a single thread is not
-    /// enough: tracing remembers that nobody is listening at a log call site
-    /// the first time some other test thread reaches it, and a scoped
-    /// subscriber then sometimes misses events, which made these tests flaky.
-    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(|| ThreadWriter)
-                .with_ansi(false)
-                .without_time()
-                .with_max_level(tracing::Level::WARN)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("no other global subscriber in the tests");
-        });
-        LOGGED.with(|logged| logged.borrow_mut().clear());
-        let result = run();
-        let bytes = LOGGED.with(|logged| std::mem::take(&mut *logged.borrow_mut()));
-        (result, String::from_utf8(bytes).expect("logs are UTF-8"))
     }
 
     /// The row numbers named by the "skipping row" log lines, in order.
@@ -985,6 +950,40 @@ mod tests {
         });
         assert!(first.expect("an item").is_err());
         assert!(logs.contains("skipped=2"), "logs: {logs}");
+    }
+
+    #[test]
+    fn the_summary_is_logged_when_the_stream_is_dropped_before_its_end() {
+        let data = "type,client,tx,amount\nbad\nbad\nbad\ndeposit,1,1,1.0\ndeposit,1,2,1.0\n";
+        let (first, logs) = capture_logs(|| {
+            let mut rows = read_transactions(data.as_bytes()).expect("header is readable");
+            let first = rows.next();
+            drop(rows);
+            first
+        });
+        assert!(first.expect("an item").is_ok());
+        assert!(logs.contains("skipped=3"), "logs: {logs}");
+    }
+
+    #[test]
+    fn the_summary_is_logged_once_when_a_finished_stream_is_dropped() {
+        let data = "type,client,tx,amount\nbad\ndeposit,1,1,1.0\n";
+        let ((), logs) = capture_logs(|| {
+            let rows = read_transactions(data.as_bytes()).expect("header is readable");
+            assert_eq!(rows.count(), 1);
+        });
+        let summaries = logs.matches("rows skipped in total").count();
+        assert_eq!(summaries, 1, "logs: {logs}");
+    }
+
+    #[test]
+    fn no_summary_is_logged_when_a_dropped_stream_skipped_nothing() {
+        let data = "type,client,tx,amount\ndeposit,1,1,1.0\ndeposit,1,2,1.0\n";
+        let (_, logs) = capture_logs(|| {
+            let mut rows = read_transactions(data.as_bytes()).expect("header is readable");
+            rows.next()
+        });
+        assert_eq!(logs, "");
     }
 
     #[test]

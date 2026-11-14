@@ -30,7 +30,8 @@ later behind a server that receives many concurrent streams.
 **Sharded workers.** One streaming reader parses rows and routes each one by
 `client_id % N` over bounded channels to `N` worker tasks. Each worker owns the
 accounts and deposit history of its clients outright, so there are no locks and
-no shared mutable state. The business rules live in a plain synchronous
+no shared account state; the only state the workers share is one atomic counter
+for the refusal log. The business rules live in a plain synchronous
 `Engine` type; Tokio is a thin layer around it.
 
 Rejected alternative: one task per transaction over `Arc<Mutex<..>>` / `DashMap`
@@ -46,14 +47,22 @@ Output would be non-deterministic.
                               bounded mpsc (capacity C)
                            ┌──────────────────────────────► worker 0 ─┐
  file ─► csv reader ─►     │                                           │
- (spawn_blocking,    router├──────────────────────────────► worker 1 ─┤─► merge ─► csv writer ─► stdout
-  streaming)    shard=id%N │                                           │
-                           └──────────────────────────────► worker N-1┘
+ (spawn_blocking,    router├──────────────────────────────► worker 1 ─┤─► accounts of
+  streaming)    shard=id%N │                                           │   all workers
+                           └──────────────────────────────► worker N-1┘       │
+                                                                              ▼
+                                                              csv writer ► stdout
+
+ All workers also write refusals to one shared refusal log (an atomic counter).
 ```
 
 Shutdown is driven by channel closure: the reader finishes, its `Sender`s are
-dropped, each worker drains its queue and returns its `Engine`, and `main`
-joins the workers and merges their account maps (client sets are disjoint).
+dropped, each worker drains its queue and returns its `Engine`, and
+`run_pipeline` joins the workers and collects their accounts (client sets are
+disjoint, so there is nothing to merge).
+If the `run_pipeline` future is dropped before it finishes, the workers are
+aborted, which closes their inboxes and stops the reader at its next send. Both
+entry points (`run_pipeline` and `run_pipeline_from_reader`) work this way.
 
 ### Types
 
@@ -105,8 +114,8 @@ Agreed rules and assumptions:
 4. A resolved deposit returns to `Normal` and may be disputed again.
    `ChargedBack` is terminal.
 5. Bad rows and refused transactions never abort the run: the row is skipped or
-   the transaction rejected, a `warn` line goes to stderr (capped, see the
-   reader), and processing continues. Only input that cannot be read at all, a
+   the transaction rejected, a `warn` line goes to stderr (capped, see AC 36
+   and AC 40), and processing continues. Only input that cannot be read at all, a
    header that lacks a required column, or a row longer than 1024 bytes ends the
    run, with an error.
 6. Deposits are stored and looked up by `(client, tx)`. A dispute, resolve or
@@ -151,23 +160,41 @@ Agreed rules and assumptions:
   silently.
 - `csv` is blocking, so the reader runs inside `tokio::task::spawn_blocking`
   and hands rows over with `Sender::blocking_send`. A blocking read on an async
-  worker thread would stall other tasks.
+  worker thread would stall other tasks. The reader is opened there too
+  (`run_pipeline_from_reader`), so waiting for the header cannot stall them
+  either.
 - A bad row: warn with its row number (counting data rows from 1, header and
   blank lines excluded) and a fixed reason, never the row's content, then skip
   it. Only the first 20 skips are logged one by one; after that they are
-  counted, and one summary with the total is logged when the stream ends. An
+  counted, and one summary with the total is logged when the stream ends or is
+  dropped. An
   I/O error, or a row over the size limit, ends the stream with an error that
   aborts the run with a non-zero exit.
 - Channels are bounded (constant capacity, e.g. 1024 per worker). When a worker
-  is slow its channel fills and `send` suspends the reader (backpressure), so
-  memory stays flat regardless of file size.
+  is slow its channel fills and `blocking_send` blocks the reader thread
+  (backpressure), so the queued transactions stay bounded whatever the size of
+  the file. A requested capacity above 1,048,576 is lowered to that, and a
+  requested worker count above 65,536 (the number of client ids) to that, so a
+  huge request cannot panic the channel or exhaust memory on workers that could
+  never receive anything.
 - Worker count `N` is `available_parallelism()`, minimum 1.
 - Workers are async tasks looping on `rx.recv().await` and calling the
-  synchronous `Engine::apply`. Rejections are logged with client and tx ids.
+  synchronous `Engine::apply`. Rejections go to one `RefusalLog` shared by all
+  workers (an atomic counter), so the cap on logged refusals holds for the whole
+  run and not per worker (AC 40). A refusal that means the engine's own
+  balances are inconsistent (`InsufficientHeld`) is the exception: input cannot
+  cause it, so it is never held back by the cap and is logged at error level.
+  It is still counted: it takes one of the 20 slots if it comes first, and it is
+  in the total of the summary.
+- After every 1024 transactions routed, the reader checks that no worker has
+  dropped its inbox. A
+  worker that is gone shows when the reader sends to its shard, but a shard the
+  input no longer names is never sent to, and the reader would read on to the
+  end of the input unaware.
 
 ### Output
 
-- After all workers return, merge the account maps and hand them to
+- After all workers return, their accounts are collected and handed to
   `write_accounts`, which writes them with `csv::Writer` to stdout in the order
   it gets them (the order of the rows is unspecified and may differ from run to
   run). If any account's total cannot be represented,
@@ -182,8 +209,17 @@ Agreed rules and assumptions:
   `info`, `debug`, `trace`). Stdout carries nothing but the CSV.
 - Exit codes: `0` success; `1` runtime failure (file cannot be opened, I/O
   error, worker panic); `2` usage error.
-- A worker panic surfaces as a `JoinError`. The run fails with a message on
-  stderr and no partial CSV is written.
+- `run_pipeline` fails with a `PipelineError`: `Read` (the input failed, a row
+  was too long, or the header was bad),
+  `WorkerPanicked`, `RouterPanicked` (the task reading the input panicked) or
+  `Stopped` (a task ended without a panic before the input did: a worker went
+  away, or the runtime was shutting down). A panic surfaces as a `JoinError`.
+  When more than one thing went wrong, a worker panic is reported first, then a
+  stopped worker, then the outcome of the reader, because a failed worker is the
+  likelier cause of the rest. The run fails with a message on stderr and no
+  partial CSV is written. In every case in which `run_pipeline` returns, the
+  summary of refusals is logged; the summary of skipped rows is logged when the
+  reader ends, including when it is stopped early.
 
 ### Layout
 
@@ -196,13 +232,18 @@ src/amount.rs    Amount newtype
 src/transaction.rs  raw row, Transaction, TryFrom
 src/account.rs   Account, DepositRecord, DisputeState
 src/engine.rs    Engine, Rejection, rules
-src/pipeline.rs  reader, router, workers, merge
+src/pipeline.rs  streaming CSV reader (Transactions)
+src/sharded.rs  router, workers, run_pipeline
+src/refusals.rs  RefusalLog: one cap on refusal logging, shared by workers
+src/test_support.rs  log-capture helper for unit tests (cfg(test) only)
 src/output.rs    CSV writer
 tests/           integration tests + fixtures
 ```
 
-Dependencies: `tokio` (rt-multi-thread, macros, sync), `csv`, `serde`,
-`tracing`, `tracing-subscriber`. No others unless a need shows up.
+Dependencies: `tokio` (`rt-multi-thread`, `sync`), `csv`, `serde`, `tracing`,
+`tracing-subscriber`. The tests also use tokio's `macros` and `time`; `macros`
+joins the runtime features when the CLI gets `#[tokio::main]`. No others unless
+a need shows up.
 
 ## Acceptance Criteria
 
@@ -330,9 +371,20 @@ Command line
 40. When the engine refuses a transaction, the system shall log a warning with
     the client id, the tx id and a fixed reason, the first 20 refusals one by
     one and then one summary with the total, and shall carry on. The summary is
-    also logged when the run ends in an error.
+    also logged when the run ends in an error. The one exception is a refusal
+    that means the engine's own balances are inconsistent, which is never held
+    back by the cap and is logged at error level; it still counts towards the
+    20 and the total.
 41. The system shall exit with the same code whether or not stderr can be
     written.
+
+Failure handling
+
+42. If the pipeline future is dropped before it finishes, then the workers and
+    the reader shall stop: the reader reads no further rows.
+43. If a worker is gone before the input ends, then the reader shall stop and
+    the run shall fail, even when no further row belongs to that worker's
+    shard. The reader notices within 1024 transactions routed.
 
 ## Out of Scope
 
@@ -363,11 +415,18 @@ Command line
   default; the alternative would hide a client that did appear in the input.
 - **Blocking CSV reader inside Tokio.** `spawn_blocking` plus `blocking_send`
   keeps the `csv` crate. For a real multi-stream server an async reader (e.g.
-  `csv-async`) would replace it. Deferred.
+  `csv-async`) would replace it. Deferred. The blocking pool is finite (about
+  512 threads), a reader stuck in `read` holds one of them, and the runtime
+  waits for it at shutdown; dropping the pipeline future cannot interrupt a
+  read in progress. A front end would need read deadlines.
+- **One busy client.** All of a client's transactions go to one worker, so a
+  single hot client runs at the speed of one worker. Inherent to ordering per
+  client.
 - **Ordering across multiple streams.** With several concurrent inputs, order
   is only defined per stream. Deferred, relevant only to the server scenario.
 - **Warning volume.** Capped per stream: the first 20 skipped rows are logged,
-  then one summary line (AC 36). The cap is per stream, not per process.
+  then one summary line (AC 36); refused transactions are capped the same way
+  (AC 40). Both caps are per stream, not per process.
 - **Quoted CSV is not supported.** A quoted field is a bad row and is skipped
   with a warning. Accepted: the format has no field that needs quoting, and
   quote handling lets one stray quote swallow the rows after it.
@@ -389,8 +448,16 @@ Command line
   matter; also usage and file-not-found exit codes (AC 1-3, 31).
 - **Concurrency:** deterministic pseudo-random transaction generator (no extra
   crate); assert 1 worker equals 8 workers (AC 27), per-client ordering
-  (AC 28), capacity-1 channel completes (AC 29), worker panic path (AC 30).
-- **Invariant check:** after every generated run, `total == available + held`
-  for every account (AC 32).
+  (AC 28), capacity-1 channel completes (AC 29). Unit tests in `sharded.rs`
+  with stand-in workers: the queue bound for several capacities (AC 29), worker
+  panic and early stop (AC 30), dropped future (AC 42) and vanished worker
+  (AC 43), and the order in which failures are reported.
+- **Logging:** the shared cap and one summary across workers, the summary on a
+  read error and on a worker panic, and the error-level exception
+  (`sharded.rs`, `refusals.rs`; AC 40); the skipped-rows summary on an early
+  drop (`pipeline.rs`; AC 36).
+- **Invariant check:** `total == available + held` and `held >= 0` for every
+  account of generated runs (`every_account_keeps_total_equal_to_available_plus_held`
+  in `tests/concurrency.rs`, 10 seeds; AC 32).
 - **Hygiene:** `cargo fmt --check` and `cargo clippy -- -D warnings` clean;
   all tests hermetic and fast.

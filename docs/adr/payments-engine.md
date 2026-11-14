@@ -164,7 +164,7 @@ withdraw 5, dispute, chargeback gives available -5, held 0, total -5). Use
 checked arithmetic and keep the claim in `credit` that `total()` never fails
 true.
 
-**Open for Task 8**: both reviewers built a randomized comparison against an
+**Open for Task 8** (see D20 for what became of the first item): both reviewers built a randomized comparison against an
 `i128` reference model, and it caught three breakages the example tests missed.
 The spec already plans a deterministic generator; make it compare against such a
 model. Log `Rejection::InsufficientHeld` at error level (it means the engine's
@@ -331,7 +331,7 @@ security re-review):
   byte per second, holds its blocking thread; a front end needs idle and total
   timeouts.
 - The log cap is per stream, not per process, and the summary is not logged if
-  the caller drops the iterator early.
+  the caller drops the iterator early (the second part superseded by D17).
 - A truncated final row is read as complete, so a dropped connection can turn
   `...,100.0` into `...,1`. A front end must require a final line ending.
 - A trailing comma on every row is rejected as an extra field; leading zeros in
@@ -398,7 +398,7 @@ Inline spec check, quality gates and mutation checks only.
 
 ## D4 — 2026-11-14 — Task 7: Sequential end-to-end CLI
 
-**Status**: Accepted
+**Status**: Accepted; amended by D9 (a refusal that means broken bookkeeping is not held back by the cap)
 **Decision**: A refused transaction is logged with its client id, tx id and a fixed reason, the first 20 individually and then one summary count, which is also logged when the run ends in an error.
 **Reason**: It is the same flood protection as for skipped rows (2 million refused withdrawals gave 21 lines), and the summary matters most when something went wrong.
 **Alternatives considered**: One line per refusal.
@@ -423,3 +423,94 @@ Inline spec check, quality gates and mutation checks only.
 **Decision**: The CRLF variant of the messy fixture is generated at test time from the LF file.
 **Reason**: Git can rewrite line endings in committed files, which would silently turn the CRLF test into a second LF test.
 **Alternatives considered**: Committing a CRLF file.
+
+## D8 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: The router, the workers and `run_pipeline` live in a new `sharded` module, and the logging of refused transactions in a new `refusals` module. `pipeline` stays the streaming reader.
+**Reason**: The reader and the concurrent layer change for different reasons, and the sequential `run` and the workers both need the refusal log.
+**Alternatives considered**: Growing `pipeline.rs`, which was already over a thousand lines with its tests.
+
+## D9 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: All workers share one `RefusalLog`, an atomic counter, so the cap of 20 logged refusals and the summary are per run and not per worker. A refusal that means the engine's own balances are inconsistent (`InsufficientHeld`) is never held back by the cap and is logged at error level, but it is still counted: it takes one of the 20 slots if it comes first and is in the total of the summary. This amends D4.
+**Reason**: With a log per worker, 8 workers would log up to 160 lines. Input cannot cause `InsufficientHeld`, so it must not be hidden behind ordinary refusals. The cost is that a broken engine could log without a cap.
+**Alternatives considered**: One log per worker, and a second counter with its own cap for the broken case (more code for a case that should never happen).
+
+## D10 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: `run_pipeline` and `run_pipeline_from_reader` are thin wrappers over a private `run_with_workers`, which takes a function that opens the input and a function that spawns a worker.
+**Reason**: Tests need workers that are slow, panic or return early, to prove backpressure, shutdown and the error mapping, and none of that can be provoked through the public functions.
+**Alternatives considered**: Making the hooks public, which would commit the API to a test need.
+
+## D11 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: The shard count and the channel capacity are `NonZeroUsize`, and both are lowered to a maximum (65,536 shards, the number of client ids; 1,048,576 queued transactions per channel) instead of failing.
+**Reason**: Zero would panic in the channel or divide by zero in `shard_of`, and `usize::MAX` would panic in the channel or in `Vec::with_capacity`. A shard past the 65,536th could never receive a transaction.
+**Alternatives considered**: Returning an error for out-of-range values, which gives callers one more case to handle for no benefit.
+
+## D12 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: `PipelineError` has a `Stopped` variant for a task that ended without panicking (a cancelled worker, or a worker that went away before the input ended). When several things go wrong, a worker panic is reported first, then a stopped worker, then the outcome of the reader.
+**Reason**: Calling every `JoinError` a panic would mislead whoever reads the message, and a failed worker is the likelier cause of a read or routing failure than the reverse.
+**Alternatives considered**: One catch-all failure, which hides which part broke.
+
+## D13 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: `run_with_workers`, which both entry points use, holds a guard that aborts the workers when it is dropped, whichever way that happens. Aborting the workers closes their inboxes, which stops the reader at its next send.
+**Reason**: Dropping a future does not stop tasks it spawned, so a timeout or a `select!` around the pipeline left the workers and the reader running.
+**Alternatives considered**: Documenting that the future must be awaited to the end, which a caller cannot always do.
+
+## D14 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: `run_pipeline_from_reader` opens the input (reads the header) inside the blocking task, and the input is passed to `run_with_workers` as a function that builds it there.
+**Reason**: Reading the header on an async thread blocks it for as long as the peer takes to send one, which on a current-thread runtime stalls everything.
+**Alternatives considered**: Calling `read_transactions` before the pipeline, as the first version did.
+
+## D15 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: After every 1024 transactions routed the reader checks that no worker has dropped its inbox, and stops with `Stopped` if one has. Rows skipped as bad are not routed and do not count towards the 1024.
+**Reason**: A worker that is gone shows when the reader sends to its shard. When the rest of the input names other shards, the reader would read to the end first, which for a long input is a long wait for a result that is already lost.
+**Alternatives considered**: Checking on every row, which costs an atomic load per shard per row, and detecting it only through the workers' join handles, which the reader cannot see.
+
+## D16 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: `tokio` is a runtime dependency with `rt-multi-thread` and `sync` only. `macros` and `time` are dev-dependency features, and `macros` moves to the runtime features in Task 9, when the CLI gets `#[tokio::main]`.
+**Reason**: The library needs neither the macros nor the timers, and a dependency feature should not be enabled before something uses it.
+**Alternatives considered**: Enabling `macros` now.
+
+## D17 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: A stream that is dropped before its end (`Transactions`) logs its summary of skipped rows when it is dropped.
+**Reason**: The reader is now stopped early when a worker goes away, and the count of skipped rows is the part of the story the caller would otherwise lose.
+**Alternatives considered**: Leaving the summary to `next`, which a caller that gives up never reaches.
+
+## D18 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: The generator of the concurrency tests makes chargebacks about 3% of the rows, and a test checks that at least a quarter of the generated transactions are applied and that some but not all accounts end up locked.
+**Reason**: A chargeback locks an account for good, and a locked account refuses the rest of its deposits and withdrawals, so too many chargebacks leave a run with little left to compare between worker counts. The first weights made them 8% of the rows. With 3%, about a third of the generated transactions are applied and 8 of 12 accounts end locked (seed 1, 3,000 rows), which the test pins as a floor.
+**Alternatives considered**: Leaving the weights and trusting the comparison.
+
+## D19 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: These limits of the pipeline are accepted and documented: the engine's memory per stream is unbounded (deposit history, one entry per deposit); the blocking pool is finite (about 512 threads), so readers stuck in `read` can starve it; the runtime waits for blocking threads when it shuts down; a hot client runs at the speed of one worker; the cap on logged refusals is per stream, not per process; a reader that stalls holds its thread, so a front end would need read deadlines; and the case where the reader's task ends without panicking has no test, because it cannot be provoked without shutting down the runtime.
+**Reason**: They are concerns of a server handling many untrusted streams, not of a batch tool that reads one file. Fixing them would need an external store, an async reader and deadlines.
+**Alternatives considered**: An async reader (`csv-async`) and per-stream limits, deferred with the server scenario.
+
+## D20 — 2026-11-14 — Task 8: Sharded concurrent pipeline
+
+**Status**: Open
+**Decision**: The randomized tests compare the sharded pipeline with a single `Engine` fed the same transactions. They do not compare the engine with an independent model of the rules, which the "Open for Task 8" note under Task 5 asked for (an `i128` reference model); no such model exists in the suite.
+**Reason**: Comparing with one `Engine` proves that sharding changes nothing, which is what Task 8 adds. The rules themselves are covered by the table-driven tests of Tasks 2 to 4, and a reference model would be a second implementation of them. Nobody has decided whether it is worth building.
+**Alternatives considered**: Building the reference model in Task 8, which would grow a task about concurrency into one about the rules.
