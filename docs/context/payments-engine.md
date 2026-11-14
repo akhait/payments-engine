@@ -111,3 +111,55 @@ still has no way to create an amount except parsing. The cost is that readers
 convert ten-thousandths (10_000 is 1.0); each test module says so at the top.
 **Alternatives considered**: making the field `pub(crate)`. Rejected, since any
 module could then bypass the checked arithmetic.
+
+## 2026-11-14: Task 3: Dispute and resolve
+
+**Decision**: `Account` gets `hold` and `release`. The engine picks the deposit
+and checks its state; `Account` owns the balance change and refuses anything
+that would take `held` below zero (`InsufficientHeld`), even though the engine
+never asks for it.
+**Reason**: Same split as `credit` / `debit`: invariants live with the data.
+Both methods work out both new balances before storing either, so a failure on
+the second cannot leave the first changed.
+
+**Decision**: A dispute or resolve changes the deposit's `DisputeState` only
+after the account change succeeded.
+**Reason**: A refused dispute (for example `held` would overflow) must leave the
+deposit `Normal` and spendable. Pinned by
+`dispute_that_would_overflow_held_is_rejected_and_state_is_unchanged`.
+
+**Decision**: `Account::credit` now also checks that `available + held` fits.
+**Reason**: So `total()` cannot become `None` for an account built through these
+methods. Added test-first in two steps: the first version of the test failed in
+its setup (`hold` not written yet), so the check went in only after the test was
+seen failing at its real assertion.
+
+**Decision**: Rejections added: `UnknownTransaction`, `NotDisputable`,
+`NotUnderDispute`, `InsufficientHeld`. A deposit that belongs to another client
+and a deposit that does not exist are both `UnknownTransaction`.
+**Reason**: Deposits are keyed by `(client, tx)`, so another client's deposit is
+simply absent under this client's key.
+
+**Decision**: `deposit` credits an existing account in place and stores a new
+account only after its first credit succeeded.
+**Reason**: Keeps "a refused deposit leaves nothing behind" structural. A
+copy-then-store version does one more hash lookup per deposit (4 operations
+instead of 3), which review pointed out for no observable gain.
+
+**Rules confirmed by tests**: a withdrawal cannot spend held funds; disputing an
+already-withdrawn deposit leaves `available` negative; a duplicate deposit id is
+refused even while the original is disputed; a withdrawal's id is never
+disputable.
+
+**Open for Task 4**: a chargeback must follow the same pattern (check, then
+change the balance, then change the state) and must check `held >= amount`. After
+a chargeback of an already-withdrawn deposit `total` can be negative (deposit 5,
+withdraw 5, dispute, chargeback gives available -5, held 0, total -5). Use
+checked arithmetic and keep the claim in `credit` that `total()` never fails
+true.
+
+**Open for Task 8**: both reviewers built a randomized comparison against an
+`i128` reference model, and it caught three breakages the example tests missed.
+The spec already plans a deterministic generator; make it compare against such a
+model. Log `Rejection::InsufficientHeld` at error level (it means the engine's
+bookkeeping is broken), and still never log `{:?}` of `Engine` or `Account`.

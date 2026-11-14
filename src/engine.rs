@@ -21,7 +21,16 @@ pub enum Rejection {
     InsufficientFunds,
     /// Applying the transaction would overflow a balance.
     Overflow,
-    /// Disputes, resolves and chargebacks are not implemented yet.
+    /// No deposit with this id exists for this client.
+    UnknownTransaction,
+    /// A dispute targeted a deposit that is already disputed or charged back.
+    NotDisputable,
+    /// A resolve targeted a deposit that is not under dispute.
+    NotUnderDispute,
+    /// More held funds were to be released than the account holds. The engine
+    /// never asks for this, so seeing it means its bookkeeping is broken.
+    InsufficientHeld,
+    /// Chargebacks are not implemented yet.
     Unsupported,
 }
 
@@ -32,6 +41,10 @@ impl fmt::Display for Rejection {
             Self::DuplicateTransaction => "this client already has a deposit with this id",
             Self::InsufficientFunds => "insufficient available funds",
             Self::Overflow => "balance would overflow",
+            Self::UnknownTransaction => "this client has no deposit with this id",
+            Self::NotDisputable => "deposit is already disputed or charged back",
+            Self::NotUnderDispute => "deposit is not under dispute",
+            Self::InsufficientHeld => "not enough held funds",
             Self::Unsupported => "transaction type is not supported yet",
         };
         f.write_str(message)
@@ -45,6 +58,7 @@ impl From<BalanceError> for Rejection {
         match error {
             BalanceError::NonPositiveAmount => Rejection::NonPositiveAmount,
             BalanceError::InsufficientFunds => Rejection::InsufficientFunds,
+            BalanceError::InsufficientHeld => Rejection::InsufficientHeld,
             BalanceError::Overflow => Rejection::Overflow,
         }
     }
@@ -77,9 +91,9 @@ impl Engine {
         match transaction {
             Transaction::Deposit { client, tx, amount } => self.deposit(client, tx, amount),
             Transaction::Withdrawal { client, amount, .. } => self.withdraw(client, amount),
-            Transaction::Dispute { .. }
-            | Transaction::Resolve { .. }
-            | Transaction::Chargeback { .. } => Err(Rejection::Unsupported),
+            Transaction::Dispute { client, tx } => self.dispute(client, tx),
+            Transaction::Resolve { client, tx } => self.resolve(client, tx),
+            Transaction::Chargeback { .. } => Err(Rejection::Unsupported),
         }
     }
 
@@ -87,14 +101,21 @@ impl Engine {
         if !amount.is_positive() {
             return Err(Rejection::NonPositiveAmount);
         }
-        // Check for a duplicate before creating the account, so a refused
-        // deposit never leaves anything behind.
         let key = (client, tx);
         if self.deposits.contains_key(&key) {
             return Err(Rejection::DuplicateTransaction);
         }
-        self.accounts.entry(client).or_default().credit(amount)?;
-        // Credit first: a deposit is only remembered once its funds were added.
+        // Credit an existing account in place. A new account is stored only
+        // after its first credit succeeded, so a refused deposit leaves no
+        // trace: no new account and no record.
+        match self.accounts.get_mut(&client) {
+            Some(account) => account.credit(amount)?,
+            None => {
+                let mut account = Account::default();
+                account.credit(amount)?;
+                self.accounts.insert(client, account);
+            }
+        }
         self.deposits.insert(
             key,
             DepositRecord {
@@ -103,6 +124,49 @@ impl Engine {
             },
         );
         Ok(())
+    }
+
+    fn dispute(&mut self, client: ClientId, tx: TxId) -> Result<(), Rejection> {
+        let (account, record) = self.account_and_deposit(client, tx)?;
+        if record.state != DisputeState::Normal {
+            return Err(Rejection::NotDisputable);
+        }
+        // Mark the deposit only after the funds were actually held.
+        account.hold(record.amount)?;
+        record.state = DisputeState::Disputed;
+        Ok(())
+    }
+
+    fn resolve(&mut self, client: ClientId, tx: TxId) -> Result<(), Rejection> {
+        let (account, record) = self.account_and_deposit(client, tx)?;
+        if record.state != DisputeState::Disputed {
+            return Err(Rejection::NotUnderDispute);
+        }
+        account.release(record.amount)?;
+        record.state = DisputeState::Normal;
+        Ok(())
+    }
+
+    /// Finds a client's account together with one of their deposits.
+    ///
+    /// Deposits are keyed by `(client, tx)`, so a deposit that belongs to
+    /// another client is simply not found here.
+    fn account_and_deposit(
+        &mut self,
+        client: ClientId,
+        tx: TxId,
+    ) -> Result<(&mut Account, &mut DepositRecord), Rejection> {
+        let record = self
+            .deposits
+            .get_mut(&(client, tx))
+            .ok_or(Rejection::UnknownTransaction)?;
+        // A recorded deposit always has an account; report a missing one as an
+        // unknown deposit instead of panicking.
+        let account = self
+            .accounts
+            .get_mut(&client)
+            .ok_or(Rejection::UnknownTransaction)?;
+        Ok((account, record))
     }
 
     fn withdraw(&mut self, client: ClientId, amount: Amount) -> Result<(), Rejection> {
@@ -136,6 +200,14 @@ mod tests {
             tx,
             amount: Amount::from_units(units),
         }
+    }
+
+    fn dispute(client: ClientId, tx: TxId) -> Transaction {
+        Transaction::Dispute { client, tx }
+    }
+
+    fn resolve(client: ClientId, tx: TxId) -> Transaction {
+        Transaction::Resolve { client, tx }
     }
 
     fn apply_all(engine: &mut Engine, transactions: &[Transaction]) {
@@ -293,16 +365,226 @@ mod tests {
     }
 
     #[test]
-    fn dispute_resolve_and_chargeback_are_not_supported_yet() {
+    fn dispute_holds_the_deposited_amount() {
         let mut engine = Engine::default();
-        let unsupported = [
-            Transaction::Dispute { client: 1, tx: 1 },
-            Transaction::Resolve { client: 1, tx: 1 },
-            Transaction::Chargeback { client: 1, tx: 1 },
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), dispute(1, 1)]);
+        assert_balances(&engine, 1, 0, 50_000);
+    }
+
+    #[test]
+    fn dispute_holds_only_the_disputed_deposit() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[deposit(1, 1, 50_000), deposit(1, 2, 20_000), dispute(1, 2)],
+        );
+        assert_balances(&engine, 1, 50_000, 20_000);
+    }
+
+    #[test]
+    fn dispute_after_a_withdrawal_can_leave_available_negative() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                withdrawal(1, 2, 50_000),
+                dispute(1, 1),
+            ],
+        );
+        assert_balances(&engine, 1, -50_000, 50_000);
+    }
+
+    #[test]
+    fn dispute_of_an_unknown_tx_is_rejected_and_creates_no_account() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000)]);
+        assert_eq!(
+            engine.apply(dispute(1, 2)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_eq!(
+            engine.apply(dispute(3, 1)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_balances(&engine, 1, 50_000, 0);
+        assert!(engine.account(3).is_none());
+    }
+
+    #[test]
+    fn dispute_naming_another_client_is_rejected_and_changes_nothing() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), deposit(2, 2, 70_000)]);
+        assert_eq!(
+            engine.apply(dispute(2, 1)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_balances(&engine, 1, 50_000, 0);
+        assert_balances(&engine, 2, 70_000, 0);
+    }
+
+    #[test]
+    fn disputing_twice_is_rejected_and_holds_the_funds_once() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), dispute(1, 1)]);
+        assert_eq!(engine.apply(dispute(1, 1)), Err(Rejection::NotDisputable));
+        assert_balances(&engine, 1, 0, 50_000);
+    }
+
+    #[test]
+    fn a_withdrawal_id_cannot_be_disputed() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[deposit(1, 1, 50_000), withdrawal(1, 2, 10_000)],
+        );
+        assert_eq!(
+            engine.apply(dispute(1, 2)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_balances(&engine, 1, 40_000, 0);
+    }
+
+    #[test]
+    fn dispute_that_would_overflow_held_is_rejected_and_state_is_unchanged() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, i64::MAX),
+                withdrawal(1, 2, i64::MAX),
+                dispute(1, 1),
+                deposit(1, 3, i64::MAX),
+            ],
+        );
+        assert_balances(&engine, 1, 0, i64::MAX);
+        assert_eq!(engine.apply(dispute(1, 3)), Err(Rejection::Overflow));
+        assert_balances(&engine, 1, 0, i64::MAX);
+        // The refused dispute must not have marked deposit 3 as disputed.
+        assert_eq!(engine.apply(resolve(1, 3)), Err(Rejection::NotUnderDispute));
+    }
+
+    #[test]
+    fn resolve_releases_the_held_funds() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[deposit(1, 1, 50_000), dispute(1, 1), resolve(1, 1)],
+        );
+        assert_balances(&engine, 1, 50_000, 0);
+    }
+
+    #[test]
+    fn resolved_deposit_can_be_disputed_again() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                dispute(1, 1),
+                resolve(1, 1),
+                dispute(1, 1),
+            ],
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+    }
+
+    #[test]
+    fn resolve_of_a_deposit_not_under_dispute_is_rejected() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000)]);
+        assert_eq!(engine.apply(resolve(1, 1)), Err(Rejection::NotUnderDispute));
+        assert_balances(&engine, 1, 50_000, 0);
+    }
+
+    #[test]
+    fn resolve_of_an_unknown_tx_or_wrong_client_is_rejected_and_changes_nothing() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), dispute(1, 1)]);
+        assert_eq!(
+            engine.apply(resolve(1, 9)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_eq!(
+            engine.apply(resolve(2, 1)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+        assert!(engine.account(2).is_none());
+    }
+
+    #[test]
+    fn withdrawal_cannot_spend_held_funds() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), dispute(1, 1)]);
+        assert_eq!(
+            engine.apply(withdrawal(1, 2, 10_000)),
+            Err(Rejection::InsufficientFunds)
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+    }
+
+    #[test]
+    fn resolve_naming_a_client_with_its_own_held_funds_changes_nothing() {
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, 50_000),
+                dispute(1, 1),
+                deposit(2, 2, 50_000),
+                dispute(2, 2),
+            ],
+        );
+        // Client 2 holds enough to cover tx 1, but tx 1 is not client 2's deposit.
+        assert_eq!(
+            engine.apply(resolve(2, 1)),
+            Err(Rejection::UnknownTransaction)
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+        assert_balances(&engine, 2, 0, 50_000);
+    }
+
+    #[test]
+    fn duplicate_deposit_id_is_rejected_while_the_original_is_disputed() {
+        let mut engine = Engine::default();
+        apply_all(&mut engine, &[deposit(1, 1, 50_000), dispute(1, 1)]);
+        assert_eq!(
+            engine.apply(deposit(1, 1, 70_000)),
+            Err(Rejection::DuplicateTransaction)
+        );
+        assert_balances(&engine, 1, 0, 50_000);
+        // The original record is intact: resolving still releases its amount.
+        apply_all(&mut engine, &[resolve(1, 1)]);
+        assert_balances(&engine, 1, 50_000, 0);
+    }
+
+    #[test]
+    fn balance_errors_map_to_the_matching_rejections() {
+        let cases = [
+            (
+                BalanceError::NonPositiveAmount,
+                Rejection::NonPositiveAmount,
+            ),
+            (
+                BalanceError::InsufficientFunds,
+                Rejection::InsufficientFunds,
+            ),
+            (BalanceError::InsufficientHeld, Rejection::InsufficientHeld),
+            (BalanceError::Overflow, Rejection::Overflow),
         ];
-        for transaction in unsupported {
-            assert_eq!(engine.apply(transaction), Err(Rejection::Unsupported));
+        for (error, expected) in cases {
+            assert_eq!(Rejection::from(error), expected);
         }
+    }
+
+    #[test]
+    fn chargeback_is_not_supported_yet() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            engine.apply(Transaction::Chargeback { client: 1, tx: 1 }),
+            Err(Rejection::Unsupported)
+        );
     }
 
     #[test]
@@ -318,6 +600,16 @@ mod tests {
             ),
             (Rejection::InsufficientFunds, "insufficient available funds"),
             (Rejection::Overflow, "balance would overflow"),
+            (
+                Rejection::UnknownTransaction,
+                "this client has no deposit with this id",
+            ),
+            (
+                Rejection::NotDisputable,
+                "deposit is already disputed or charged back",
+            ),
+            (Rejection::NotUnderDispute, "deposit is not under dispute"),
+            (Rejection::InsufficientHeld, "not enough held funds"),
             (
                 Rejection::Unsupported,
                 "transaction type is not supported yet",

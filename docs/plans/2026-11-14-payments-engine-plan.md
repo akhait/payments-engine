@@ -73,6 +73,7 @@ parts), AC 19 (already `Disputed`), AC 20, AC 21, AC 22 and AC 23 (resolve
 part). For example `deposit,1,1,5.0` then `dispute,1,1` gives available 0,
 held 5, total 5; a dispute on another client's tx changes nothing; after
 `resolve` the same tx can be disputed again.
+**Status**: Complete
 
 ### Task 4: Chargeback and account locking
 

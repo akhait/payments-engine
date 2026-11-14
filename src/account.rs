@@ -9,6 +9,8 @@ pub enum BalanceError {
     NonPositiveAmount,
     /// The available balance is smaller than the amount to remove.
     InsufficientFunds,
+    /// The held balance is smaller than the amount to release.
+    InsufficientHeld,
     /// The result does not fit in an [`Amount`].
     Overflow,
 }
@@ -49,17 +51,20 @@ impl Account {
     /// Adds `amount` to the available balance.
     ///
     /// Fails with [`BalanceError::NonPositiveAmount`] if `amount` is zero or
-    /// negative, or [`BalanceError::Overflow`] if the new available balance
-    /// does not fit. (The check that available plus held also fits arrives
-    /// together with disputes, the first way to make `held` non-zero.)
+    /// negative, or [`BalanceError::Overflow`] if the new available balance or
+    /// the new total (available plus held) does not fit.
     pub(crate) fn credit(&mut self, amount: Amount) -> Result<(), BalanceError> {
-        if !amount.is_positive() {
-            return Err(BalanceError::NonPositiveAmount);
-        }
-        self.available = self
+        ensure_positive(amount)?;
+        let available = self
             .available
             .checked_add(amount)
             .ok_or(BalanceError::Overflow)?;
+        // The total has to stay representable as well, so that `total()` never
+        // fails for an account built through these methods.
+        available
+            .checked_add(self.held)
+            .ok_or(BalanceError::Overflow)?;
+        self.available = available;
         Ok(())
     }
 
@@ -69,9 +74,7 @@ impl Account {
     /// negative, or [`BalanceError::InsufficientFunds`] if less than `amount`
     /// is available.
     pub(crate) fn debit(&mut self, amount: Amount) -> Result<(), BalanceError> {
-        if !amount.is_positive() {
-            return Err(BalanceError::NonPositiveAmount);
-        }
+        ensure_positive(amount)?;
         // For a positive amount, ending below zero and underflowing the
         // representation both mean the same thing: not enough funds.
         self.available = self
@@ -80,6 +83,55 @@ impl Account {
             .filter(|remaining| *remaining >= Amount::ZERO)
             .ok_or(BalanceError::InsufficientFunds)?;
         Ok(())
+    }
+
+    /// Moves `amount` from available to held, because of a dispute.
+    ///
+    /// Available may become negative; the total does not change.
+    pub(crate) fn hold(&mut self, amount: Amount) -> Result<(), BalanceError> {
+        ensure_positive(amount)?;
+        // Work out both new balances before storing either, so a failure on the
+        // second cannot leave the first already changed.
+        let available = self
+            .available
+            .checked_sub(amount)
+            .ok_or(BalanceError::Overflow)?;
+        let held = self
+            .held
+            .checked_add(amount)
+            .ok_or(BalanceError::Overflow)?;
+        self.available = available;
+        self.held = held;
+        Ok(())
+    }
+
+    /// Moves `amount` from held back to available, when a dispute is resolved.
+    ///
+    /// Fails with [`BalanceError::InsufficientHeld`] if less than `amount` is
+    /// held, so the held balance can never go negative.
+    pub(crate) fn release(&mut self, amount: Amount) -> Result<(), BalanceError> {
+        ensure_positive(amount)?;
+        let held = self
+            .held
+            .checked_sub(amount)
+            .filter(|remaining| *remaining >= Amount::ZERO)
+            .ok_or(BalanceError::InsufficientHeld)?;
+        let available = self
+            .available
+            .checked_add(amount)
+            .ok_or(BalanceError::Overflow)?;
+        self.held = held;
+        self.available = available;
+        Ok(())
+    }
+}
+
+/// Balance changes only ever move a strictly positive amount.
+fn ensure_positive(amount: Amount) -> Result<(), BalanceError> {
+    if amount.is_positive() {
+        Ok(())
+    } else {
+        Err(BalanceError::NonPositiveAmount)
     }
 }
 
@@ -191,5 +243,106 @@ mod tests {
             );
         }
         assert_eq!(account.available(), Amount::from_units(50_000));
+    }
+
+    #[test]
+    fn credit_that_would_overflow_the_total_is_rejected_and_changes_nothing() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(i64::MAX)).unwrap();
+        account.hold(Amount::from_units(i64::MAX)).unwrap();
+        // Available (0) plus 1 fits, but available plus held plus 1 does not.
+        assert_eq!(
+            account.credit(Amount::from_units(1)),
+            Err(BalanceError::Overflow)
+        );
+        assert_eq!(account.available(), Amount::ZERO);
+        assert_eq!(account.held(), Amount::from_units(i64::MAX));
+    }
+
+    #[test]
+    fn hold_moves_funds_from_available_to_held() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(30_000));
+        assert_eq!(account.held(), Amount::from_units(20_000));
+        assert_eq!(account.total(), Some(Amount::from_units(50_000)));
+    }
+
+    #[test]
+    fn hold_can_drive_available_negative_but_keeps_the_total() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(10_000)).unwrap();
+        account.hold(Amount::from_units(15_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(-5_000));
+        assert_eq!(account.held(), Amount::from_units(15_000));
+        assert_eq!(account.total(), Some(Amount::from_units(10_000)));
+    }
+
+    #[test]
+    fn hold_that_would_overflow_held_is_rejected_and_changes_nothing() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(i64::MAX)).unwrap();
+        account.hold(Amount::from_units(i64::MAX)).unwrap();
+        // Available (0) can go to -1, but held (MAX) cannot grow: neither may change.
+        assert_eq!(
+            account.hold(Amount::from_units(1)),
+            Err(BalanceError::Overflow)
+        );
+        assert_eq!(account.available(), Amount::ZERO);
+        assert_eq!(account.held(), Amount::from_units(i64::MAX));
+    }
+
+    #[test]
+    fn release_moves_funds_from_held_back_to_available() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        account.release(Amount::from_units(20_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(50_000));
+        assert_eq!(account.held(), Amount::ZERO);
+    }
+
+    #[test]
+    fn release_of_more_than_held_is_rejected_and_changes_nothing() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        assert_eq!(
+            account.release(Amount::from_units(20_001)),
+            Err(BalanceError::InsufficientHeld)
+        );
+        assert_eq!(account.available(), Amount::from_units(30_000));
+        assert_eq!(account.held(), Amount::from_units(20_000));
+    }
+
+    #[test]
+    fn hold_and_release_reject_zero_and_negative_amounts() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        for bad in [0, -1] {
+            assert_eq!(
+                account.hold(Amount::from_units(bad)),
+                Err(BalanceError::NonPositiveAmount)
+            );
+            assert_eq!(
+                account.release(Amount::from_units(bad)),
+                Err(BalanceError::NonPositiveAmount)
+            );
+        }
+        assert_eq!(account.available(), Amount::from_units(30_000));
+        assert_eq!(account.held(), Amount::from_units(20_000));
+    }
+
+    #[test]
+    fn credit_while_funds_are_held_only_changes_available() {
+        let mut account = Account::default();
+        account.credit(Amount::from_units(50_000)).unwrap();
+        account.hold(Amount::from_units(20_000)).unwrap();
+        account.credit(Amount::from_units(10_000)).unwrap();
+        assert_eq!(account.available(), Amount::from_units(40_000));
+        assert_eq!(account.held(), Amount::from_units(20_000));
+        assert_eq!(account.total(), Some(Amount::from_units(60_000)));
     }
 }
