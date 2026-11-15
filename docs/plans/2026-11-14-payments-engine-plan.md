@@ -33,8 +33,9 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 
 Follow-up commits that belong to finished tasks: `477aa49` (tests build amounts
 from raw units), `acfb739` (the output writer checks totals with
-`try_for_each`) and the commit "test(concurrency): generate test input with
-fastrand".
+`try_for_each`), the commit "test(concurrency): generate test input with
+fastrand" and the commit "feat(pipeline): send transactions to the workers in
+batches" (D26).
 
 ## Tasks
 
@@ -185,7 +186,7 @@ accounts of all engines are concatenated. Add a seeded pseudo-random
 transaction generator for tests (`fastrand`, a dev-dependency, which replaced a
 hand-written generator; see D21).
 The router stops at the first `Err` item (a failing input or an oversize row),
-lets the workers drain what they were already sent, and returns that error.
+sends what it had buffered, lets the workers drain it, and returns that error.
 Shard and channel sizes are `NonZeroUsize`, so a zero cannot be passed, and both
 are lowered to a maximum (65,536 shards, 1,048,576 queued transactions). The
 code lives in a new `sharded` module rather than in `pipeline.rs`, which is the
@@ -258,10 +259,10 @@ how correctness is checked (type system, tests, invariants), error handling and
 logging, and the known memory limit of the deposit history. Run a manual
 large-input check: generate several million rows into the scratchpad directory
 (not the repo), run the release build under `/usr/bin/time -l`, confirm memory
-stays flat, and record the wall-clock and CPU time next to the figures that
-reviewers reported for the sequential version (D24). The README also says that
-`TOKIO_WORKER_THREADS` has no effect (D23), that warnings are not in input order
-(D24), and what the throughput caveat is. Confirm the repo contains no mention of the company or its
+stays flat, and record the wall-clock and CPU time next to the figures in D26.
+The README also says that `TOKIO_WORKER_THREADS` has no effect (D23), that
+warnings are not in input order (D24), and how the throughput was measured and
+what limits it (D26). Confirm the repo contains no mention of the company or its
 products and does not contain the challenge PDF.
 **Files**: `README.md`
 **Depends on**: Task 9

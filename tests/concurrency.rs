@@ -141,13 +141,45 @@ async fn every_shard_count_and_channel_size_matches_a_single_engine() {
         let transactions = generated(seed, 2_000, 30, 25);
         let expected = reference(&transactions);
         for shards in [1, 2, 3, 5, 8, 16] {
-            for capacity in [1, 2, 64, 1024] {
+            for capacity in [1, 2, 64, 257, 600, 1024] {
                 let actual = pipeline(&transactions, shards, capacity).await;
                 assert_eq!(
                     actual, expected,
                     "seed {seed}, {shards} shards, capacity {capacity}"
                 );
             }
+        }
+    }
+}
+
+/// The same transaction for another client.
+fn on_client(transaction: Transaction, client: u16) -> Transaction {
+    match transaction {
+        Transaction::Deposit { tx, amount, .. } => Transaction::Deposit { client, tx, amount },
+        Transaction::Withdrawal { tx, amount, .. } => {
+            Transaction::Withdrawal { client, tx, amount }
+        }
+        Transaction::Dispute { tx, .. } => Transaction::Dispute { client, tx },
+        Transaction::Resolve { tx, .. } => Transaction::Resolve { client, tx },
+        Transaction::Chargeback { tx, .. } => Transaction::Chargeback { client, tx },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_sizes_around_the_batch_size_match_a_single_engine() {
+    // Capacity 1024 gives batches of 256. The clients go round-robin over the
+    // shards, so that every shard gets exactly `count` rows and ends just before,
+    // on or just after a batch boundary.
+    for count in [0, 1, 255, 256, 257, 511, 512, 513, 1_025] {
+        for shards in [1usize, 2, 4] {
+            let transactions: Vec<Transaction> = generated(5, count * shards, 40, 40)
+                .into_iter()
+                .enumerate()
+                .map(|(row, transaction)| on_client(transaction, (row % shards) as u16))
+                .collect();
+            let expected = reference(&transactions);
+            let actual = pipeline(&transactions, shards, 1024).await;
+            assert_eq!(actual, expected, "{count} rows per shard, {shards} shards");
         }
     }
 }
@@ -182,6 +214,8 @@ async fn every_account_keeps_total_equal_to_available_plus_held() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_clients_transactions_are_applied_in_input_order() {
+    // A client's deposit and withdrawal are next to each other, so with batches
+    // of 4 they often share a batch, where a reversed order would show.
     let one = amount("1.0");
     let mut transactions = Vec::new();
     for round in 0..100u32 {
@@ -191,8 +225,6 @@ async fn each_clients_transactions_are_applied_in_input_order() {
                 tx: round * 2 + 1,
                 amount: one,
             });
-        }
-        for client in 0..100u16 {
             transactions.push(Transaction::Withdrawal {
                 client,
                 tx: round * 2 + 2,

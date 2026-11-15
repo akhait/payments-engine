@@ -25,16 +25,28 @@ const MAX_SHARDS: usize = ClientId::MAX as usize + 1;
 
 /// The most transactions a channel is allowed to hold, whatever is requested.
 ///
-/// It keeps a request such as `usize::MAX` from panicking in the channel, and
-/// holds the memory a stalled worker can pin to a known amount per channel.
+/// It holds the memory that a stalled worker can pin to a known amount per
+/// channel.
 const MAX_CAPACITY: usize = 1 << 20;
 
-/// How many transactions the router sends between two checks that no worker is
-/// gone. Rows skipped as bad are not sent and do not count.
+/// How many transactions the router hands to one worker in one message.
 ///
-/// A worker that is gone shows when the router sends to it. A shard the input
-/// no longer names is never sent to, so without this check the router would
-/// read on to the end of the input before it noticed.
+/// A message costs the same however many transactions it carries, and sending
+/// one transaction at a time made the pipeline slower than a single thread. A
+/// smaller channel limit than this gets a smaller batch.
+const BATCH_SIZE: usize = 256;
+
+/// What the router sends to a worker: some of its transactions, in input order.
+type Batch = Vec<Transaction>;
+
+/// How many transactions the router routes, whether it has sent them yet or
+/// still holds them in a buffer, between two checks that no worker is gone. Rows
+/// skipped as bad are not routed and do not count.
+///
+/// A worker that is gone shows when the router sends a batch to it. A shard the
+/// input no longer names is never sent to, and a shard that is named only now
+/// and then fills a batch slowly, so without this check the router could read
+/// on for a long time before it noticed.
 const LIVENESS_CHECK_INTERVAL: usize = 1024;
 
 /// The pipeline could not produce the accounts.
@@ -82,25 +94,81 @@ fn shard_of(client: ClientId, shards: usize) -> usize {
     usize::from(client) % shards
 }
 
-/// Sends every transaction to the channel of the shard that owns its client.
+/// How a channel limit of `capacity` transactions (at least 1) is spent: the
+/// size of a batch, and how many batches the channel holds.
 ///
-/// Blocks while a channel is full, which holds the reader back. Meant to run
-/// on a thread that may block, not on an async worker. `senders` must not be
-/// empty.
+/// The channel never holds more than `capacity` transactions, and a limit
+/// smaller than [`BATCH_SIZE`] gets a batch of that size, so that a limit of 1
+/// still means one transaction at a time.
+fn channel_shape(capacity: usize) -> (usize, usize) {
+    debug_assert!(capacity >= 1, "a channel holds at least one transaction");
+    let batch = capacity.min(BATCH_SIZE);
+    (batch, capacity / batch)
+}
+
+/// [`channel_shape`] for a requested limit, lowered to [`MAX_CAPACITY`].
+fn shape_for(capacity: NonZeroUsize) -> (usize, usize) {
+    channel_shape(capacity.get().min(MAX_CAPACITY))
+}
+
+/// Sends every transaction to the shard that owns its client, in batches of
+/// `batch` (at least 1).
+///
+/// A shard's transactions are collected until there are `batch` of them, and
+/// then sent as one message, so the order of a client's transactions is kept.
+/// What is left over when the input ends is sent last. Blocks while a channel
+/// is full, which holds the reader back. Meant to run on a thread that may
+/// block, not on an async worker. `senders` must not be empty.
 ///
 /// Stops with [`RouteError::WorkerGone`] as soon as a send fails, and also
-/// when a periodic check finds that some worker has dropped its inbox.
-fn route<I>(rows: I, senders: &[mpsc::Sender<Transaction>]) -> Result<(), RouteError>
+/// when a periodic check finds that some worker has dropped its inbox. When the
+/// input fails to read, the transactions read before the error are still sent,
+/// so the workers see everything that was read; a worker that is gone, or a
+/// panic in the input, skips that. If the input fails and a worker turns out to
+/// be gone while the rest is sent, the worker is what is reported, as in the
+/// pipeline, where a failed worker outranks the outcome of the reader.
+fn route<I>(rows: I, senders: &[mpsc::Sender<Batch>], batch: usize) -> Result<(), RouteError>
+where
+    I: Iterator<Item = Result<Transaction, ReadError>>,
+{
+    debug_assert!(batch >= 1, "a batch holds at least one transaction");
+    let mut buffers = vec![Batch::new(); senders.len()];
+    let routed = route_rows(rows, senders, batch, &mut buffers);
+    if matches!(routed, Err(RouteError::WorkerGone)) {
+        return routed;
+    }
+    // Sending a failed worker's batch is what reveals it, so its error goes
+    // first.
+    flush(senders, &mut buffers).and(routed)
+}
+
+/// The loop of [`route`]: collects the transactions of each shard into
+/// `buffers` and sends a buffer when it is full.
+fn route_rows<I>(
+    rows: I,
+    senders: &[mpsc::Sender<Batch>],
+    batch: usize,
+    buffers: &mut [Batch],
+) -> Result<(), RouteError>
 where
     I: Iterator<Item = Result<Transaction, ReadError>>,
 {
     let mut since_check = 0;
     for row in rows {
         let transaction = row.map_err(RouteError::Read)?;
-        let sender = &senders[shard_of(transaction.client(), senders.len())];
-        sender
-            .blocking_send(transaction)
-            .map_err(|_| RouteError::WorkerGone)?;
+        let shard = shard_of(transaction.client(), senders.len());
+        let buffer = &mut buffers[shard];
+        // A buffer grows as rows arrive, so a shard that gets few rows does not
+        // hold room for a whole batch: with very many shards that would be far
+        // more memory than the input. Once a shard has filled a batch it is busy,
+        // and its next buffer is sized for a full batch.
+        buffer.push(transaction);
+        if buffer.len() >= batch {
+            let full = std::mem::replace(buffer, Vec::with_capacity(batch));
+            senders[shard]
+                .blocking_send(full)
+                .map_err(|_| RouteError::WorkerGone)?;
+        }
         since_check += 1;
         if since_check == LIVENESS_CHECK_INTERVAL {
             since_check = 0;
@@ -112,13 +180,26 @@ where
     Ok(())
 }
 
+/// Sends what is left in the buffers, leaving them empty.
+fn flush(senders: &[mpsc::Sender<Batch>], buffers: &mut [Batch]) -> Result<(), RouteError> {
+    let mut result = Ok(());
+    for (sender, buffer) in senders.iter().zip(buffers) {
+        if !buffer.is_empty() && sender.blocking_send(std::mem::take(buffer)).is_err() {
+            result = Err(RouteError::WorkerGone);
+        }
+    }
+    result
+}
+
 /// Applies the transactions it receives to its own engine until the channel
 /// closes, then hands the engine back.
-async fn worker(mut inbox: mpsc::Receiver<Transaction>, refusals: Arc<RefusalLog>) -> Engine {
+async fn worker(mut inbox: mpsc::Receiver<Batch>, refusals: Arc<RefusalLog>) -> Engine {
     let mut engine = Engine::default();
-    while let Some(transaction) = inbox.recv().await {
-        if let Err(reason) = engine.apply(transaction) {
-            refusals.record(&transaction, reason);
+    while let Some(batch) = inbox.recv().await {
+        for transaction in batch {
+            if let Err(reason) = engine.apply(transaction) {
+                refusals.record(&transaction, reason);
+            }
         }
     }
     engine
@@ -149,7 +230,7 @@ async fn collect_workers(workers: Vec<JoinHandle<Engine>>) -> Result<Vec<Engine>
 }
 
 fn spawn_worker_task(
-    inbox: mpsc::Receiver<Transaction>,
+    inbox: mpsc::Receiver<Batch>,
     refusals: Arc<RefusalLog>,
 ) -> JoinHandle<Engine> {
     tokio::spawn(worker(inbox, refusals))
@@ -174,8 +255,11 @@ impl Drop for AbortOnDrop {
 /// in no particular order.
 ///
 /// Each channel holds at most `capacity` transactions, so a slow worker slows
-/// the reader down instead of letting memory grow. `shards` is lowered to
-/// 65,536, which is as many as client ids can use, and `capacity` to 1,048,576.
+/// the reader down instead of letting memory grow. Transactions travel in
+/// batches of up to 256 (fewer when `capacity` is smaller), and the reader holds
+/// one more batch per shard while it fills it or waits to send it. `shards` is
+/// lowered to 65,536, which is as many as client ids can use, and `capacity` to
+/// 1,048,576.
 ///
 /// `rows` is consumed on a thread that is allowed to block. To read from a
 /// reader, use [`run_pipeline_from_reader`], which also opens the input there.
@@ -251,15 +335,15 @@ async fn run_with_workers<I, O, F>(
 where
     I: Iterator<Item = Result<Transaction, ReadError>>,
     O: FnOnce() -> Result<I, ReadError> + Send + 'static,
-    F: Fn(mpsc::Receiver<Transaction>, Arc<RefusalLog>) -> JoinHandle<Engine>,
+    F: Fn(mpsc::Receiver<Batch>, Arc<RefusalLog>) -> JoinHandle<Engine>,
 {
     let shards = shards.get().min(MAX_SHARDS);
-    let capacity = capacity.get().min(MAX_CAPACITY);
+    let (batch, slots) = shape_for(capacity);
     let refusals = Arc::new(RefusalLog::default());
     let mut senders = Vec::with_capacity(shards);
     let mut workers = Vec::with_capacity(shards);
     for _ in 0..shards {
-        let (sender, inbox) = mpsc::channel(capacity);
+        let (sender, inbox) = mpsc::channel(slots);
         senders.push(sender);
         workers.push(spawn_worker(inbox, Arc::clone(&refusals)));
     }
@@ -271,7 +355,7 @@ where
     // it ends. That tells the workers to finish what they were sent and stop.
     let routed = tokio::task::spawn_blocking(move || {
         let rows = open().map_err(RouteError::Read)?;
-        route(rows, &senders)
+        route(rows, &senders, batch)
     })
     .await;
     let engines = collect_workers(workers).await;
@@ -325,6 +409,15 @@ mod tests {
         I: Send + 'static,
     {
         move || Ok(rows)
+    }
+
+    /// The batches that reached an inbox, once the router has finished with it.
+    fn batches_in(inbox: &mut mpsc::Receiver<Batch>) -> Vec<Batch> {
+        let mut batches = Vec::new();
+        while let Some(batch) = inbox.blocking_recv() {
+            batches.push(batch);
+        }
+        batches
     }
 
     /// Runs a future to completion on this thread. Everything the pipeline
@@ -385,13 +478,14 @@ mod tests {
             .map(|n| Ok(deposit((n % 6) as u16, n + 1)))
             .collect();
         let (senders, mut inboxes): (Vec<_>, Vec<_>) = (0..3).map(|_| mpsc::channel(64)).unzip();
-        assert!(route(rows.into_iter(), &senders).is_ok());
+        assert!(route(rows.into_iter(), &senders, 4).is_ok());
         drop(senders);
         for (shard, inbox) in inboxes.iter_mut().enumerate() {
-            let mut seen = Vec::new();
-            while let Some(transaction) = inbox.blocking_recv() {
-                seen.push((transaction.client(), transaction.tx()));
-            }
+            let seen: Vec<(ClientId, u32)> = batches_in(inbox)
+                .into_iter()
+                .flatten()
+                .map(|transaction| (transaction.client(), transaction.tx()))
+                .collect();
             assert!(!seen.is_empty(), "shard {shard} got nothing");
             assert!(
                 seen.iter()
@@ -406,62 +500,174 @@ mod tests {
     }
 
     #[test]
-    fn route_stops_at_the_first_error_and_reports_it() {
-        let rows = vec![Ok(deposit(1, 1)), Err(a_read_error()), Ok(deposit(1, 2))];
+    fn route_sends_full_batches_and_flushes_the_rest_at_the_end() {
+        let rows = (1..=10u32).map(|tx| Ok(deposit(1, tx)));
         let (sender, mut inbox) = mpsc::channel(8);
-        let result = route(rows.into_iter(), std::slice::from_ref(&sender));
-        assert!(matches!(result, Err(RouteError::Read(_))));
+        assert!(route(rows, std::slice::from_ref(&sender), 4).is_ok());
         drop(sender);
-        let mut received = 0;
-        while inbox.blocking_recv().is_some() {
-            received += 1;
-        }
-        assert_eq!(received, 1);
+        let lengths: Vec<usize> = batches_in(&mut inbox).iter().map(Vec::len).collect();
+        assert_eq!(lengths, [4, 4, 2]);
     }
 
     #[test]
-    fn route_stops_at_once_when_a_worker_is_gone() {
+    fn route_sends_nothing_for_an_empty_input_and_no_empty_batch_at_the_end() {
+        let (sender, mut inbox) = mpsc::channel(8);
+        assert!(route(std::iter::empty(), std::slice::from_ref(&sender), 4).is_ok());
+        let rows = (1..=8u32).map(|tx| Ok(deposit(1, tx)));
+        assert!(route(rows, std::slice::from_ref(&sender), 4).is_ok());
+        drop(sender);
+        let lengths: Vec<usize> = batches_in(&mut inbox).iter().map(Vec::len).collect();
+        assert_eq!(lengths, [4, 4]);
+    }
+
+    #[test]
+    fn route_sends_a_batch_as_soon_as_it_is_full() {
+        // One slot and a batch of 3: the first batch goes out when the third
+        // row arrives, and the router then blocks on the second, so the input is
+        // read exactly up to the sixth row.
+        let produced = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&produced);
+        let rows = (1..=100u32).map(move |tx| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(deposit(1, tx))
+        });
+        let (sender, mut inbox) = mpsc::channel(1);
+        let router = std::thread::spawn(move || route(rows, &[sender], 3).is_ok());
+        let started = std::time::Instant::now();
+        while produced.load(Ordering::SeqCst) < 6 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the router never got to the second batch"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(produced.load(Ordering::SeqCst), 6);
+        let received: usize = batches_in(&mut inbox).iter().map(Vec::len).sum();
+        assert_eq!(received, 100);
+        assert!(router.join().expect("the router thread"));
+    }
+    #[test]
+    fn route_stops_at_the_first_error_and_reports_it_after_sending_what_it_had_read() {
+        let rows = vec![Ok(deposit(1, 1)), Err(a_read_error()), Ok(deposit(1, 2))];
+        let (sender, mut inbox) = mpsc::channel(8);
+        // The batch size is larger than the number of rows read before the error,
+        // so the row before it is still waiting in the router's buffer.
+        let result = route(rows.into_iter(), std::slice::from_ref(&sender), 4);
+        assert!(matches!(result, Err(RouteError::Read(_))));
+        drop(sender);
+        let received: Vec<u32> = batches_in(&mut inbox)
+            .into_iter()
+            .flatten()
+            .map(|transaction| transaction.tx())
+            .collect();
+        assert_eq!(received, [1]);
+    }
+
+    #[test]
+    fn a_worker_that_is_gone_is_reported_before_a_read_error() {
+        // The row before the error is still in the router's buffer when the
+        // input fails, and sending it shows that the worker is gone. As in the
+        // pipeline, a failed worker outranks what the reader found.
+        let rows = vec![Ok(deposit(1, 1)), Err(a_read_error())];
+        let (sender, inbox) = mpsc::channel(8);
+        drop(inbox);
+        let result = route(rows.into_iter(), &[sender], 4);
+        assert!(matches!(result, Err(RouteError::WorkerGone)));
+    }
+
+    #[test]
+    fn a_shard_that_has_barely_been_used_does_not_hold_a_full_batch_of_memory() {
+        // With many shards, most of them may see a few rows at most, and a buffer
+        // of a whole batch for each would be far more memory than the input.
+        let (senders, _inboxes): (Vec<_>, Vec<_>) = (0..8).map(|_| mpsc::channel(4)).unzip();
+        let mut buffers = vec![Batch::new(); 8];
+        let rows = (0..8u16).map(|client| Ok(deposit(client, u32::from(client) + 1)));
+        assert!(route_rows(rows, &senders, BATCH_SIZE, &mut buffers).is_ok());
+        for (shard, buffer) in buffers.iter().enumerate() {
+            assert_eq!(buffer.len(), 1, "shard {shard}");
+            assert!(
+                buffer.capacity() < BATCH_SIZE,
+                "shard {shard} holds room for {} rows for one row",
+                buffer.capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn a_shard_that_has_filled_a_batch_keeps_room_for_the_next() {
+        // A batch of 10 is larger than the smallest buffer a Vec allocates, so a
+        // buffer that started from nothing again would show.
+        let (sender, _inbox) = mpsc::channel(4);
+        let mut buffers = vec![Batch::new()];
+        let rows = (1..=11u32).map(|tx| Ok(deposit(1, tx)));
+        assert!(route_rows(rows, std::slice::from_ref(&sender), 10, &mut buffers).is_ok());
+        assert_eq!(buffers[0].len(), 1);
+        assert!(buffers[0].capacity() >= 10, "the next batch would regrow");
+    }
+
+    #[test]
+    fn route_reports_a_worker_that_is_gone_when_it_sends_the_last_batch() {
         let (sender, inbox) = mpsc::channel(8);
         drop(inbox);
         let produced = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&produced);
-        let rows = (1..=1_000u32).map(move |tx| {
+        let rows = (1..=3u32).map(move |tx| {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(deposit(1, tx))
         });
-        let result = route(rows, &[sender]);
+        let result = route(rows, &[sender], 8);
         assert!(matches!(result, Err(RouteError::WorkerGone)));
-        assert_eq!(produced.load(Ordering::SeqCst), 1);
+        assert_eq!(produced.load(Ordering::SeqCst), 3);
+    }
+    #[test]
+    fn route_stops_at_the_next_full_batch_when_the_worker_of_the_shard_is_gone() {
+        for batch in [1, 4, BATCH_SIZE] {
+            let (sender, inbox) = mpsc::channel(8);
+            drop(inbox);
+            let produced = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&produced);
+            let rows = (1..=1_000u32).map(move |tx| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(deposit(1, tx))
+            });
+            let result = route(rows, &[sender], batch);
+            assert!(matches!(result, Err(RouteError::WorkerGone)));
+            assert_eq!(produced.load(Ordering::SeqCst), batch, "batch {batch}");
+        }
     }
 
     #[test]
     fn route_notices_a_worker_that_goes_away_on_a_shard_the_input_no_longer_names() {
         // Every row belongs to shard 1, so shard 0 is never sent to. Its worker
         // goes away while the input is being read, and only the periodic check
-        // can find out. The check runs after every LIVENESS_CHECK_INTERVAL rows.
-        for (dies_at_row, noticed_at_row) in [
-            (10, LIVENESS_CHECK_INTERVAL),
-            (LIVENESS_CHECK_INTERVAL + 10, 2 * LIVENESS_CHECK_INTERVAL),
-        ] {
-            let (dead, gone) = mpsc::channel(8);
-            let mut doomed = Some(gone);
-            let (live, _inbox) = mpsc::channel(100_000);
-            let produced = Arc::new(AtomicUsize::new(0));
-            let counter = Arc::clone(&produced);
-            let rows = (1..=50_000u32).map(move |tx| {
-                counter.fetch_add(1, Ordering::SeqCst);
-                if tx as usize == dies_at_row {
-                    doomed.take();
-                }
-                Ok(deposit(1, tx))
-            });
-            let result = route(rows, &[dead, live]);
-            assert!(matches!(result, Err(RouteError::WorkerGone)));
-            assert_eq!(
-                produced.load(Ordering::SeqCst),
-                noticed_at_row,
-                "the worker went away at row {dies_at_row}"
-            );
+        // can find out. The check runs after every LIVENESS_CHECK_INTERVAL rows
+        // routed, whatever the size of a batch.
+        for batch in [1, 4, BATCH_SIZE] {
+            for (dies_at_row, noticed_at_row) in [
+                (10, LIVENESS_CHECK_INTERVAL),
+                (LIVENESS_CHECK_INTERVAL + 10, 2 * LIVENESS_CHECK_INTERVAL),
+            ] {
+                let (dead, gone) = mpsc::channel(8);
+                let mut doomed = Some(gone);
+                let (live, _inbox) = mpsc::channel(100_000);
+                let produced = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&produced);
+                let rows = (1..=50_000u32).map(move |tx| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if tx as usize == dies_at_row {
+                        doomed.take();
+                    }
+                    Ok(deposit(1, tx))
+                });
+                let result = route(rows, &[dead, live], batch);
+                assert!(matches!(result, Err(RouteError::WorkerGone)));
+                assert_eq!(
+                    produced.load(Ordering::SeqCst),
+                    noticed_at_row,
+                    "batch {batch}: the worker went away at row {dies_at_row}"
+                );
+            }
         }
     }
 
@@ -474,7 +680,7 @@ mod tests {
             Ok(deposit(1, tx))
         });
         let (sender, mut inbox) = mpsc::channel(2);
-        let router = std::thread::spawn(move || route(rows, &[sender]).is_ok());
+        let router = std::thread::spawn(move || route(rows, &[sender], 1).is_ok());
 
         // Two transactions fit in the channel and a third has been taken from
         // the input and is waiting to be sent: the reader cannot go further.
@@ -489,12 +695,46 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(produced.load(Ordering::SeqCst), 3);
 
-        let mut received = 0;
-        while inbox.blocking_recv().is_some() {
-            received += 1;
-        }
+        let received: usize = batches_in(&mut inbox).iter().map(Vec::len).sum();
         assert_eq!(received, 100);
         assert!(router.join().expect("the router thread"));
+    }
+
+    #[test]
+    fn a_channel_limit_is_split_into_batches_and_slots_that_never_exceed_it() {
+        let cases = [
+            (1, (1, 1)),
+            (2, (2, 1)),
+            (3, (3, 1)),
+            (10, (10, 1)),
+            (255, (255, 1)),
+            (256, (256, 1)),
+            (257, (256, 1)),
+            (511, (256, 1)),
+            (512, (256, 2)),
+            (1000, (256, 3)),
+            (1024, (256, 4)),
+            (MAX_CAPACITY, (256, 4096)),
+        ];
+        for (capacity, expected) in cases {
+            assert_eq!(channel_shape(capacity), expected, "capacity {capacity}");
+        }
+        for capacity in 1..=4096 {
+            let (batch, slots) = channel_shape(capacity);
+            assert!(batch >= 1 && slots >= 1, "capacity {capacity}");
+            assert!(batch * slots <= capacity, "capacity {capacity}");
+            assert!(
+                batch * (slots + 1) > capacity,
+                "capacity {capacity}: a slot is wasted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_capacity_beyond_the_maximum_is_lowered_to_it() {
+        assert_eq!(shape_for(nz(1024)), (256, 4));
+        assert_eq!(shape_for(nz(MAX_CAPACITY)), (256, 4096));
+        assert_eq!(shape_for(NonZeroUsize::MAX), (256, 4096));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -556,12 +796,13 @@ mod tests {
         let (engine, logs) = capture_logs(|| {
             block_on_current_thread(async {
                 let (sender, inbox) = mpsc::channel(8);
+                // Two batches, so that the worker is shown to go on after the first.
                 sender
-                    .send(deposit(1, 1))
+                    .send(vec![deposit(1, 1)])
                     .await
                     .expect("the worker listens");
                 sender
-                    .send(withdrawal(1, 2, 50_000))
+                    .send(vec![withdrawal(1, 2, 15_000), deposit(1, 3)])
                     .await
                     .expect("the worker listens");
                 drop(sender);
@@ -569,7 +810,9 @@ mod tests {
             })
         });
         let account = engine.account(1).expect("client 1 has an account");
-        assert_eq!(account.available(), Amount::from_units(10_000));
+        // The withdrawal is refused only if it is applied before the deposit
+        // after it in the same batch, so this checks the order inside a batch.
+        assert_eq!(account.available(), Amount::from_units(20_000));
         let line = logs.lines().next().expect("the refusal was logged");
         assert!(line.contains("client=1 tx=2 "), "{line}");
         assert!(line.contains("insufficient available funds"), "{line}");
@@ -634,10 +877,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_requested_capacity_limits_how_far_the_reader_runs_ahead() {
-        for capacity in [1, 2, 3, 10] {
+        const ROWS: usize = 3_000;
+        for capacity in [1, 2, 3, 10, 256, 300, 600] {
             let produced = Arc::new(AtomicUsize::new(0));
             let counter = Arc::clone(&produced);
-            let rows = (1..=50u32).map(move |tx| {
+            let rows = (1..=ROWS as u32).map(move |tx| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(deposit(1, tx))
             });
@@ -656,11 +900,12 @@ mod tests {
                 },
             ));
 
-            // The worker holds still: `capacity` transactions fit in the
-            // channel and one more has been taken from the input and waits to
-            // be sent.
+            // The worker holds still. The channel holds `slots` batches, and the
+            // router has filled one more batch and waits to send it.
+            let (batch, slots) = channel_shape(capacity);
+            let stalled_at = slots * batch + batch;
             let started = std::time::Instant::now();
-            while produced.load(Ordering::SeqCst) < capacity + 1 {
+            while produced.load(Ordering::SeqCst) < stalled_at {
                 assert!(
                     started.elapsed() < Duration::from_secs(5),
                     "capacity {capacity}: the reader never reached the channel limit"
@@ -670,7 +915,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(
                 produced.load(Ordering::SeqCst),
-                capacity + 1,
+                stalled_at,
                 "capacity {capacity}"
             );
 
@@ -680,7 +925,7 @@ mod tests {
                 .expect("the pipeline task")
                 .expect("the pipeline succeeds");
             assert_eq!(accounts.len(), 1);
-            assert_eq!(produced.load(Ordering::SeqCst), 50);
+            assert_eq!(produced.load(Ordering::SeqCst), ROWS);
         }
     }
 

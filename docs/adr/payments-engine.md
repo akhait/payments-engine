@@ -447,7 +447,7 @@ Inline spec check, quality gates and mutation checks only.
 
 ## D11 — 2026-11-14 — Task 8: Sharded concurrent pipeline
 
-**Status**: Accepted
+**Status**: Accepted; the reason for the capacity limit is corrected by D26
 **Decision**: The shard count and the channel capacity are `NonZeroUsize`, and both are lowered to a maximum (65,536 shards, the number of client ids; 1,048,576 queued transactions per channel) instead of failing.
 **Reason**: Zero would panic in the channel or divide by zero in `shard_of`, and `usize::MAX` would panic in the channel or in `Vec::with_capacity`. A shard past the 65,536th could never receive a transaction.
 **Alternatives considered**: Returning an error for out-of-range values, which gives callers one more case to handle for no benefit.
@@ -475,7 +475,7 @@ Inline spec check, quality gates and mutation checks only.
 
 ## D15 — 2026-11-14 — Task 8: Sharded concurrent pipeline
 
-**Status**: Accepted
+**Status**: Accepted; since batching (D26) a send is one batch of up to 256 rows, and the 1024 counts rows routed, whether sent or still buffered
 **Decision**: After every 1024 transactions routed the reader checks that no worker has dropped its inbox, and stops with `Stopped` if one has. Rows skipped as bad are not routed and do not count towards the 1024.
 **Reason**: A worker that is gone shows when the reader sends to its shard. When the rest of the input names other shards, the reader would read to the end first, which for a long input is a long wait for a result that is already lost.
 **Alternatives considered**: Checking on every row, which costs an atomic load per shard per row, and detecting it only through the workers' join handles, which the reader cannot see.
@@ -544,12 +544,32 @@ Inline spec check, quality gates and mutation checks only.
 **Status**: Accepted
 **Decision**: `run` is async and uses the sharded pipeline. It takes the shard count and the channel capacity as parameters, and the command line passes one worker per core (`default_shards()`, from `available_parallelism()`, minimum 1) and a channel of 1024 transactions per worker (`DEFAULT_CHANNEL_CAPACITY`). The sequential path is removed. `RunError::Read` becomes `RunError::Pipeline`, and the report is written by a small `report` function that does nothing when the pipeline failed.
 **Reason**: The binary has one path, so what the tests exercise is what ships. The sequential implementation is not needed as a reference: the concurrency tests compare the pipeline with one `Engine` (see D20 for what that does and does not prove).
-**Cost**: Workers record refusals concurrently, so the log lines are in no fixed order, and which refusals fall in the first 20 can differ between runs. The rows of the report do not differ. Two reviewers timed both versions independently on generated files of about 3 million rows and 5,000 clients (80 to 90 MB, 10 cores, release build). They found 2.0 to 2.5 s for the sequential path against 2.4 to 3.0 s for this one, and 5.3 to 5.5 s of CPU time against about 2.1 s, with identical reports. I did not run the measurement myself. Parsing the CSV costs the same in both versions. The likely cause of the difference is that the concurrent version adds a channel send, and often a thread wake-up, for every row on the reader's critical path, which costs more than the apply work it moves to the workers; the system time (about 0.03 s sequential against 1.2 to 2.1 s concurrent in one reviewer's runs) points to the wake-ups. That was not confirmed by profiling. Sending batches of transactions per channel message is the likely remedy, and is not done. Nothing tests that the binary starts more than one worker: the wiring of `default_shards()` in `main` is unchecked.
+**Cost**: Workers record refusals concurrently, so the log lines are in no fixed order, and which refusals fall in the first 20 can differ between runs. The rows of the report do not differ. Two reviewers timed both versions independently on generated files of about 3 million rows and 5,000 clients (80 to 90 MB, 10 cores, release build). They found 2.0 to 2.5 s for the sequential path against 2.4 to 3.0 s for this one, and 5.3 to 5.5 s of CPU time against about 2.1 s, with identical reports. I did not run the measurement myself. Parsing the CSV costs the same in both versions. The likely cause of the difference is that the concurrent version adds a channel send, and often a thread wake-up, for every row on the reader's critical path, which costs more than the apply work it moves to the workers; the system time (about 0.03 s sequential against 1.2 to 2.1 s concurrent in one reviewer's runs) points to the wake-ups. That was not confirmed by profiling. Batching fixed it, see D26. Nothing tests that the binary starts more than one worker: the wiring of `default_shards()` in `main` is unchecked.
 **Alternatives considered**: Keeping the sequential `run` beside the new one, which leaves dead code in the binary and two paths to keep the same.
 
 ## D25 — 2026-11-15 — Task 9: Switch the CLI to the concurrent pipeline
 
-**Status**: Accepted
+**Status**: Accepted; since batching (D26), "the next send to it" is the next batch for its shard, up to 256 of its rows later, and the bound of 1024 rows routed is unchanged
 **Decision**: The command line does nothing extra about a worker that goes away or about blocking threads at shutdown. A dead worker is noticed at the next send to it, or within 1024 transactions routed (D15), and the run exits with code 1 and nothing on stdout. No shutdown timeout is set on the runtime.
 **Reason**: `run` awaits the reader to its end on every path, and the future is never dropped, so no blocking thread outlives it and the runtime has nothing to wait for. A reader that hangs inside `read` hangs the run itself, which D6 and D19 already accept.
 **Alternatives considered**: `Runtime::shutdown_timeout`, which only helps when a task outlives the run, and none does.
+
+## D26 — 2026-11-15 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: The router sends transactions to a worker in batches of up to 256 instead of one message per transaction. `capacity` still counts transactions: the channel holds `capacity / batch` batches (at least one), and a capacity below 256 gives batches of that size, so a capacity of 1 still means one transaction at a time. The router sends what it has buffered when the input ends and when it fails to read, so the workers see every transaction that was read; a worker that is gone, or a panic in the input, skips that, and only the refusal counts in the summary are affected, since the run fails anyway. If the input fails and the flush shows a worker to be gone, the worker is what is reported, as D12 says.
+**Reason**: One message per transaction made the concurrent pipeline slower than the sequential one it replaced (D24). I measured it on a generated file of 3 million rows and 5,000 clients (80 MB, release build, a 10-core machine, five runs of each build alternating, `RUST_LOG=off`, reports with the same rows):
+
+| Build | Wall s (median) | CPU s (user + sys) | Peak MB |
+|---|---|---|---|
+| Sequential (Task 8 commit) | 2.13 to 2.14 | 2.1 | 108 |
+| One message per transaction | 2.66 and 3.15 (two sessions) | 5.4 and 6.6 | 126 to 129 |
+| Batches of 16 | 1.84 | 2.75 | 127 |
+| Batches of 64 | 1.73 | 2.30 | 126 |
+| Batches of 256 | 1.72 | 2.13 | 127 |
+| Batches of 1024 | 1.71 | 2.03 | 129 |
+
+From 64 up the time is the same within noise, so 256 sits on the plateau, with CPU time equal to the sequential build. The gain over sequential is the apply work moving to the workers, and it is small because the reader, which parses the CSV, remains the limit; a parallel parser would be needed to go further.
+**Cost**: The router buffers up to 255 transactions for each shard. A buffer grows as rows arrive, so a shard that gets few rows holds little, and only a shard that has filled a batch keeps room for a full one (4 KiB with 16-byte transactions, which a reviewer measured), so the memory is proportional to the input. The first version reserved a full buffer on a shard's first row; a reviewer measured 442 MB of peak memory against 154 MB for a file of 65,536 rows naming every client id, with a library caller asking for 65,536 shards (the command line is not affected, as it uses one shard per core), and growing the buffers on demand removed that. A worker can be behind by `capacity` plus two batches (the channel, the batch the router waits to send, and the batch the worker is applying). A transaction waits for its batch to fill; that does not matter for a file, but a front end serving live streams would need a flush timeout. AC 29 now says the bound excludes the router's one batch.
+**Correction to D11**: the capacity limit no longer protects the channel from a panic, because the limit is divided by the batch size before it reaches the channel. It still bounds the memory a stalled worker can pin, which is why it stays.
+**Alternatives considered**: One message per transaction (slower than sequential); a batch of 1024 or more (the same time, more memory in flight); parsing in parallel (a different design, not needed for a file); an unbounded channel (no backpressure).

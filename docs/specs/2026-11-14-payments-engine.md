@@ -173,10 +173,19 @@ Agreed rules and assumptions:
 - Channels are bounded (constant capacity, 1024 per worker in the CLI). When a worker
   is slow its channel fills and `blocking_send` blocks the reader thread
   (backpressure), so the queued transactions stay bounded whatever the size of
-  the file. A requested capacity above 1,048,576 is lowered to that, and a
-  requested worker count above 65,536 (the number of client ids) to that, so a
-  huge request cannot panic the channel or exhaust memory on workers that could
-  never receive anything.
+  the file. The router collects each shard's transactions into batches of up to
+  256 and sends a batch as one message, because one message per transaction made
+  the pipeline slower than a single thread (D26). The capacity still counts
+  transactions: the channel holds `capacity / 256` batches, at least one, and a
+  capacity below 256 gives batches of that size, so a capacity of 1 still means
+  one transaction at a time. The router also holds at most one unsent batch for
+  each shard, which it sends when the input ends or fails to read, so the workers
+  see every transaction that was read (a worker that is gone, or a panic in the
+  input, skips that). A shard's buffer grows as rows arrive, so a shard that gets
+  few rows holds little memory. A requested capacity above 1,048,576 is lowered
+  to that, which bounds the memory a stalled worker can pin, and a requested
+  worker count above 65,536 (the number of client ids) to that, so a huge
+  request cannot exhaust memory on workers that could never receive anything.
 - Worker count `N` is `available_parallelism()`, minimum 1. The Tokio runtime
   gets the same number of worker threads, set explicitly, so the
   `TOKIO_WORKER_THREADS` environment variable has no effect.
@@ -342,8 +351,9 @@ Concurrency
     input of 10,000 interleaved deposit/withdrawal pairs across 100 clients
     run on 8 workers, no withdrawal is rejected for insufficient funds.
 29. While a worker is slower than the reader, the number of queued transactions
-    shall not exceed channel capacity per worker. With capacity 1 the pipeline
-    shall still complete without deadlock.
+    shall not exceed channel capacity per worker, not counting the one batch (at
+    most 256 transactions) that the router holds for it. With capacity 1 the
+    pipeline shall still complete without deadlock.
 30. If a worker task panics, then the system shall exit with code 1, print an
     error to stderr, and write no CSV rows to stdout.
 
@@ -439,17 +449,18 @@ Failure handling
   rows and the workers log refusals from different threads, so the two kinds of
   warning are not in input order relative to each other, and refusals are in
   no fixed order among themselves when there is more than one worker.
-- **Throughput of the concurrent path.** On input that is bound by CSV parsing
-  the concurrent path is slower, and uses more CPU, than a sequential one. Two
-  reviewers timed it independently on a generated file of 3 million rows and
-  5,000 clients (about 90 MB, release build, 10 cores): 2.0 to 2.5 s
-  sequential against 2.4 to 3.0 s concurrent, and 5.3 to 5.5 s of CPU against
-  about 2.1 s. Parsing costs the same in both. The likely cause of the difference
-  is that the concurrent path adds a channel send, and often a thread wake-up,
-  for every row on the reader's critical path, which costs more than the apply
-  work it moves to the workers; it was not confirmed by profiling. Sending
-  batches of rows per message is the likely remedy and is not done (D24). Task
-  10 records time and CPU for its large-input check.
+- **Throughput of the concurrent path.** Resolved by batching (D26). Sending one
+  message per transaction, the concurrent path was slower than a sequential one
+  on a generated file of 3 million rows and 5,000 clients (80 MB, release
+  build, 10 cores, median of 5 runs): 2.1 s sequential against 2.7 to 3.2 s,
+  with 5.4 to 6.6 s of CPU against 2.1 s. Parsing costs the same in both; the
+  likely cause is that every message costs a send, and often a thread wake-up,
+  on the reader's critical path, more than the apply work it moves to the
+  workers (not confirmed by profiling). With batches of 256 it takes 1.7 s and
+  2.1 s of CPU, and peaks at 127 MB of memory against 108 MB. The reader, which
+  parses the CSV, remains the limit, so this is not a general speed-up: going
+  further would need the parsing itself to run in parallel. Task 10 records
+  time and CPU for its large-input check.
 - **Quoted CSV is not supported.** A quoted field is a bad row and is skipped
   with a warning. Accepted: the format has no field that needs quoting, and
   quote handling lets one stray quote swallow the rows after it.
@@ -482,7 +493,8 @@ Failure handling
   panic through the binary.
 - **Concurrency:** seeded pseudo-random transaction generator (`fastrand`, a
   dev-dependency); assert 1 worker equals 8 workers (AC 27), per-client ordering
-  (AC 28), capacity-1 channel completes (AC 29). Unit tests in `sharded.rs`
+  (AC 28), capacity-1 channel completes (AC 29), input sizes around the batch
+  size match a single engine. Unit tests in `sharded.rs`
   with stand-in workers: the queue bound for several capacities (AC 29), worker
   panic and early stop (AC 30), dropped future (AC 42) and vanished worker
   (AC 43), and the order in which failures are reported.
