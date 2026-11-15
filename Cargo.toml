@@ -16,3 +16,4 @@ overflow-checks = true
 
 [dev-dependencies]
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "time"] }
+fastrand = "2.5.0"

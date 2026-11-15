@@ -241,9 +241,10 @@ tests/           integration tests + fixtures
 ```
 
 Dependencies: `tokio` (`rt-multi-thread`, `sync`), `csv`, `serde`, `tracing`,
-`tracing-subscriber`. The tests also use tokio's `macros` and `time`; `macros`
-joins the runtime features when the CLI gets `#[tokio::main]`. No others unless
-a need shows up.
+`tracing-subscriber`. The tests also use tokio's `macros` and `time`, and
+`fastrand` for seeded test data (dev-dependencies only); `macros` joins the
+runtime features when the CLI gets `#[tokio::main]`. No others unless a need
+shows up.
 
 ## Acceptance Criteria
 
@@ -446,8 +447,8 @@ Failure handling
 - **Integration:** run the real binary on small hand-written fixtures in
   `tests/fixtures/`, compare output as a set of rows so row order does not
   matter; also usage and file-not-found exit codes (AC 1-3, 31).
-- **Concurrency:** deterministic pseudo-random transaction generator (no extra
-  crate); assert 1 worker equals 8 workers (AC 27), per-client ordering
+- **Concurrency:** seeded pseudo-random transaction generator (`fastrand`, a
+  dev-dependency); assert 1 worker equals 8 workers (AC 27), per-client ordering
   (AC 28), capacity-1 channel completes (AC 29). Unit tests in `sharded.rs`
   with stand-in workers: the queue bound for several capacities (AC 29), worker
   panic and early stop (AC 30), dropped future (AC 42) and vanished worker

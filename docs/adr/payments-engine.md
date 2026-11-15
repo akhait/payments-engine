@@ -498,7 +498,7 @@ Inline spec check, quality gates and mutation checks only.
 
 **Status**: Accepted
 **Decision**: The generator of the concurrency tests makes chargebacks about 3% of the rows, and a test checks that at least a quarter of the generated transactions are applied and that some but not all accounts end up locked.
-**Reason**: A chargeback locks an account for good, and a locked account refuses the rest of its deposits and withdrawals, so too many chargebacks leave a run with little left to compare between worker counts. The first weights made them 8% of the rows. With 3%, about a third of the generated transactions are applied and 8 of 12 accounts end locked (seed 1, 3,000 rows), which the test pins as a floor.
+**Reason**: A chargeback locks an account for good, and a locked account refuses the rest of its deposits and withdrawals, so too many chargebacks leave a run with little left to compare between worker counts. The first weights made them 8% of the rows. With 3%, about a third of the generated transactions are applied and 8 of 12 accounts end locked (seed 1, 3,000 rows), which the test pins as a floor (the figures are for the first, hand-written generator; see D21 for the current ones).
 **Alternatives considered**: Leaving the weights and trusting the comparison.
 
 ## D19 — 2026-11-14 — Task 8: Sharded concurrent pipeline
@@ -514,3 +514,19 @@ Inline spec check, quality gates and mutation checks only.
 **Decision**: The randomized tests compare the sharded pipeline with a single `Engine` fed the same transactions. They do not compare the engine with an independent model of the rules, which the "Open for Task 8" note under Task 5 asked for (an `i128` reference model); no such model exists in the suite.
 **Reason**: Comparing with one `Engine` proves that sharding changes nothing, which is what Task 8 adds. The rules themselves are covered by the table-driven tests of Tasks 2 to 4, and a reference model would be a second implementation of them. Nobody has decided whether it is worth building.
 **Alternatives considered**: Building the reference model in Task 8, which would grow a task about concurrency into one about the rules.
+
+## D21 — 2026-11-15 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: The seeded test generator uses `fastrand` 2.5.0, a dev-dependency, instead of a hand-written xorshift64* generator.
+**Reason**: There is less code to read and trust, and the crate gives a range API (`rng.u16(0..n)`) instead of a modulo. It has no dependencies of its own and is not in the release tree. Version 2.5.0 was published on 2026-07-19 and is not yanked, and RustSec has no advisory for the crate. After the swap, seeds 1 to 12 apply between 767 and 945 of 3,000 generated transactions (26% to 32%) and leave between 6 and 10 of 12 accounts locked, so the quality test now checks all twelve seeds against a floor of 20% applied, with some but not all accounts locked.
+**Cost**: A seed replays the same input only while `Cargo.lock` keeps the same version of `fastrand`, and the generated input differs from before. The tests compare the pipeline with one engine, so no expected value had to change, and the mutants that change the pipeline's output were killed again with the new generator.
+**Alternatives considered**: `rand`, with a larger tree and a seeded stream that is not stable across versions; `proptest`, which shrinks failures but is heavy and awkward with async tests; keeping the hand-written generator, whose stream never changes.
+
+## D22 — 2026-11-15 — Task 8: Sharded concurrent pipeline
+
+**Status**: Accepted
+**Decision**: A worker that has gone away is not replaced. The run stops with `PipelineError::WorkerPanicked` or `Stopped`, no accounts are returned, and the CLI will exit with code 1.
+**Reason**: A worker's state is its `Engine`, the accounts and deposit history of its clients, and it is lost with the worker, together with the transactions still queued in its inbox. We also cannot tell whether the transaction it was applying took effect. A fresh worker would start empty and report balances that look valid and are wrong: withdrawals refused for insufficient funds, disputes refused for unknown deposits. A panic also means a broken invariant, so replaying the same input would probably fail the same way. For a batch tool that reads one file, stopping and rerunning is correct.
+**Cost**: One failed worker loses the whole run, however much of the input was already processed.
+**Alternatives considered**: Respawning with an empty engine, which gives wrong balances; keeping every transaction of each shard in memory to replay it, which gives up the bounded memory of the streaming design; snapshotting the engines and replaying from the last snapshot, or a durable per-shard log, which only a long-running server with many streams would need. The last two are deferred with the server scenario (D19).

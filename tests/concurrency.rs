@@ -14,29 +14,6 @@ use payments_engine::transaction::{ClientId, Transaction};
 
 type Accounts = Vec<(ClientId, Account)>;
 
-/// A small deterministic generator (xorshift64*), so that no extra crate is
-/// needed and a failing seed can be replayed.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, limit: u64) -> u64 {
-        self.next() % limit
-    }
-}
-
 fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("a non-zero number")
 }
@@ -57,17 +34,21 @@ const AMOUNTS: [&str; 7] = [
 
 /// Transactions of every kind over few clients and few tx ids, so that
 /// clients are shared by many rows, ids repeat, and disputes often hit.
+///
+/// The generator is seeded, so a failing seed can be replayed. The same seed
+/// gives the same transactions as long as the version of `fastrand` in
+/// `Cargo.lock` does not change.
 fn generated(seed: u64, count: usize, clients: u16, tx_ids: u32) -> Vec<Transaction> {
-    let mut rng = Rng::new(seed);
+    let mut rng = fastrand::Rng::with_seed(seed);
     (0..count)
         .map(|_| {
-            let client = rng.below(u64::from(clients)) as u16;
-            let tx = 1 + rng.below(u64::from(tx_ids)) as u32;
-            let amount = amount(AMOUNTS[rng.below(AMOUNTS.len() as u64) as usize]);
+            let client = rng.u16(0..clients);
+            let tx = rng.u32(1..=tx_ids);
+            let amount = amount(AMOUNTS[rng.usize(..AMOUNTS.len())]);
             // Chargebacks lock an account for good, so they are kept rare: with
             // more, nearly every account would be locked early and refuse the
             // rest of its rows, and the run would stop testing anything.
-            match rng.below(100) {
+            match rng.u8(0..100) {
                 0..=44 => Transaction::Deposit { client, tx, amount },
                 45..=64 => Transaction::Withdrawal { client, tx, amount },
                 65..=84 => Transaction::Dispute { client, tx },
@@ -127,15 +108,21 @@ fn applied_and_locked(transactions: &[Transaction]) -> (usize, usize, usize) {
 
 #[test]
 fn the_generated_input_applies_a_fair_share_and_does_not_lock_every_account() {
-    let transactions = generated(1, 3_000, 12, 40);
-    let (applied, accounts, locked) = applied_and_locked(&transactions);
-    let total = transactions.len();
-    assert!(
-        applied * 100 >= total * 25,
-        "only {applied} of {total} transactions were applied"
-    );
-    assert!(locked >= 1, "no account was ever locked");
-    assert!(locked < accounts, "all {accounts} accounts ended up locked");
+    // Several seeds, so that the floors do not depend on one stream of numbers.
+    for seed in 1..=12 {
+        let transactions = generated(seed, 3_000, 12, 40);
+        let (applied, accounts, locked) = applied_and_locked(&transactions);
+        let total = transactions.len();
+        assert!(
+            applied * 100 >= total * 20,
+            "seed {seed}: only {applied} of {total} transactions were applied"
+        );
+        assert!(locked >= 1, "seed {seed}: no account was ever locked");
+        assert!(
+            locked < accounts,
+            "seed {seed}: all {accounts} accounts ended up locked"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

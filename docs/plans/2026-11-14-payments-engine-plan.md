@@ -32,8 +32,9 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 - [ ] Task 10: README and final verification
 
 Follow-up commits that belong to finished tasks: `477aa49` (tests build amounts
-from raw units) and `acfb739` (the output writer checks totals with
-`try_for_each`).
+from raw units), `acfb739` (the output writer checks totals with
+`try_for_each`) and the commit "test(concurrency): generate test input with
+fastrand".
 
 ## Tasks
 
@@ -180,8 +181,9 @@ capacity) -> Result<Vec<(ClientId, Account)>, PipelineError>`: a
 `recv().await` and logs rejections; when senders drop the workers
 return their `Engine`s; a `collect_workers` helper joins them (a panic is
 `PipelineError::WorkerPanicked`, any other `JoinError` is `Stopped`) and the
-accounts of all engines are concatenated. Add a deterministic pseudo-random
-transaction generator (no extra crate) for tests.
+accounts of all engines are concatenated. Add a seeded pseudo-random
+transaction generator for tests (`fastrand`, a dev-dependency, which replaced a
+hand-written generator; see D21).
 The router stops at the first `Err` item (a failing input or an oversize row),
 lets the workers drain what they were already sent, and returns that error.
 Shard and channel sizes are `NonZeroUsize`, so a zero cannot be passed, and both
