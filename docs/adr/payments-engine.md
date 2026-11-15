@@ -398,7 +398,7 @@ Inline spec check, quality gates and mutation checks only.
 
 ## D4 — 2026-11-14 — Task 7: Sequential end-to-end CLI
 
-**Status**: Accepted; amended by D9 (a refusal that means broken bookkeeping is not held back by the cap)
+**Status**: Accepted; amended by D9 (a refusal that means broken bookkeeping is not held back by the cap) and by D24 (with several workers the 20 logged are the first 20 recorded)
 **Decision**: A refused transaction is logged with its client id, tx id and a fixed reason, the first 20 individually and then one summary count, which is also logged when the run ends in an error.
 **Reason**: It is the same flood protection as for skipped rows (2 million refused withdrawals gave 21 lines), and the summary matters most when something went wrong.
 **Alternatives considered**: One line per refusal.
@@ -482,7 +482,7 @@ Inline spec check, quality gates and mutation checks only.
 
 ## D16 — 2026-11-14 — Task 8: Sharded concurrent pipeline
 
-**Status**: Accepted
+**Status**: Accepted; the part about moving `macros` to the runtime features in Task 9 is superseded by D23
 **Decision**: `tokio` is a runtime dependency with `rt-multi-thread` and `sync` only. `macros` and `time` are dev-dependency features, and `macros` moves to the runtime features in Task 9, when the CLI gets `#[tokio::main]`.
 **Reason**: The library needs neither the macros nor the timers, and a dependency feature should not be enabled before something uses it.
 **Alternatives considered**: Enabling `macros` now.
@@ -526,7 +526,30 @@ Inline spec check, quality gates and mutation checks only.
 ## D22 — 2026-11-15 — Task 8: Sharded concurrent pipeline
 
 **Status**: Accepted
-**Decision**: A worker that has gone away is not replaced. The run stops with `PipelineError::WorkerPanicked` or `Stopped`, no accounts are returned, and the CLI will exit with code 1.
+**Decision**: A worker that has gone away is not replaced. The run stops with `PipelineError::WorkerPanicked` or `Stopped`, no accounts are returned, and the CLI exits with code 1.
 **Reason**: A worker's state is its `Engine`, the accounts and deposit history of its clients, and it is lost with the worker, together with the transactions still queued in its inbox. We also cannot tell whether the transaction it was applying took effect. A fresh worker would start empty and report balances that look valid and are wrong: withdrawals refused for insufficient funds, disputes refused for unknown deposits. A panic also means a broken invariant, so replaying the same input would probably fail the same way. For a batch tool that reads one file, stopping and rerunning is correct.
 **Cost**: One failed worker loses the whole run, however much of the input was already processed.
 **Alternatives considered**: Respawning with an empty engine, which gives wrong balances; keeping every transaction of each shard in memory to replay it, which gives up the bounded memory of the streaming design; snapshotting the engines and replaying from the last snapshot, or a durable per-shard log, which only a long-running server with many streams would need. The last two are deferred with the server scenario (D19).
+
+## D23 — 2026-11-15 — Task 9: Switch the CLI to the concurrent pipeline
+
+**Status**: Accepted (corrected during the review of Task 9; the first version gave a reason that was wrong, see below)
+**Decision**: `main` builds the Tokio runtime with `tokio::runtime::Builder` and calls `block_on`, instead of using `#[tokio::main]`, and sets the number of worker threads explicitly, to the same number as the shards. Tokio's `macros` feature stays a dev-dependency feature. This supersedes the plan's wording and the second half of D16.
+**Reason**: Left unset, tokio reads `TOKIO_WORKER_THREADS` and panics on a value it cannot use (empty, `0`, negative, not a number, not UTF-8), which gave exit code 101 in the first version of this change; D2 keeps the exit codes to 0, 1 and 2. Setting the count means tokio never reads the variable. Building the runtime by hand also keeps `tokio-macros` out of the release build.
+**Accepted limit**: The first version of this entry said a hand-built runtime turns a failure to start into an ordinary error. That was wrong. With only the `rt-multi-thread` and `sync` features there is no driver to fail, and if the operating system refuses to start a thread, tokio panics (in `build`, and in `spawn_blocking` for the reader), which gives exit code 101 however the runtime is built. That is accepted: it comes from the environment and not from the input, and nothing reaches stdout. The `map_err` in `main` is a safeguard and has no test.
+**Alternatives considered**: `#[tokio::main]`, which is what the plan said and which reads the same environment variable; catching the panic, which is not worth it for an environment that cannot run the program anyway.
+
+## D24 — 2026-11-15 — Task 9: Switch the CLI to the concurrent pipeline
+
+**Status**: Accepted
+**Decision**: `run` is async and uses the sharded pipeline. It takes the shard count and the channel capacity as parameters, and the command line passes one worker per core (`default_shards()`, from `available_parallelism()`, minimum 1) and a channel of 1024 transactions per worker (`DEFAULT_CHANNEL_CAPACITY`). The sequential path is removed. `RunError::Read` becomes `RunError::Pipeline`, and the report is written by a small `report` function that does nothing when the pipeline failed.
+**Reason**: The binary has one path, so what the tests exercise is what ships. The sequential implementation is not needed as a reference: the concurrency tests compare the pipeline with one `Engine` (see D20 for what that does and does not prove).
+**Cost**: Workers record refusals concurrently, so the log lines are in no fixed order, and which refusals fall in the first 20 can differ between runs. The rows of the report do not differ. Two reviewers timed both versions independently on generated files of about 3 million rows and 5,000 clients (80 to 90 MB, 10 cores, release build). They found 2.0 to 2.5 s for the sequential path against 2.4 to 3.0 s for this one, and 5.3 to 5.5 s of CPU time against about 2.1 s, with identical reports. I did not run the measurement myself. Parsing the CSV costs the same in both versions. The likely cause of the difference is that the concurrent version adds a channel send, and often a thread wake-up, for every row on the reader's critical path, which costs more than the apply work it moves to the workers; the system time (about 0.03 s sequential against 1.2 to 2.1 s concurrent in one reviewer's runs) points to the wake-ups. That was not confirmed by profiling. Sending batches of transactions per channel message is the likely remedy, and is not done. Nothing tests that the binary starts more than one worker: the wiring of `default_shards()` in `main` is unchecked.
+**Alternatives considered**: Keeping the sequential `run` beside the new one, which leaves dead code in the binary and two paths to keep the same.
+
+## D25 — 2026-11-15 — Task 9: Switch the CLI to the concurrent pipeline
+
+**Status**: Accepted
+**Decision**: The command line does nothing extra about a worker that goes away or about blocking threads at shutdown. A dead worker is noticed at the next send to it, or within 1024 transactions routed (D15), and the run exits with code 1 and nothing on stdout. No shutdown timeout is set on the runtime.
+**Reason**: `run` awaits the reader to its end on every path, and the future is never dropped, so no blocking thread outlives it and the runtime has nothing to wait for. A reader that hangs inside `read` hangs the run itself, which D6 and D19 already accept.
+**Alternatives considered**: `Runtime::shutdown_timeout`, which only helps when a task outlives the run, and none does.

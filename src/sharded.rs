@@ -301,7 +301,7 @@ mod tests {
 
     use super::*;
     use crate::amount::Amount;
-    use crate::test_support::capture_logs;
+    use crate::test_support::{a_read_error, capture_logs, nz};
 
     fn withdrawal(client: ClientId, tx: u32, units: i64) -> Transaction {
         Transaction::Withdrawal {
@@ -317,10 +317,6 @@ mod tests {
             tx,
             amount: Amount::from_units(10_000),
         }
-    }
-
-    fn nz(n: usize) -> NonZeroUsize {
-        NonZeroUsize::new(n).expect("a non-zero number")
     }
 
     /// Input that is already built, in the form `run_with_workers` takes.
@@ -345,14 +341,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), future)
             .await
             .expect("the pipeline finished within 30 seconds")
-    }
-
-    /// A real read error, obtained from input that has no header.
-    fn a_read_error() -> ReadError {
-        let Err(error) = read_transactions("deposit,1,1,1.0\n".as_bytes()) else {
-            panic!("input without a header should fail");
-        };
-        error
     }
 
     /// A reader that blocks in `read` until released, like a peer that has

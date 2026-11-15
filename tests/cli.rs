@@ -242,6 +242,66 @@ fn an_oversize_row_exits_with_1_and_prints_nothing_to_stdout() {
     );
 }
 
+/// Rows for many clients, listed from the highest id down, with all the deposits
+/// before all the withdrawals so that the rows of one client are far apart.
+/// Every tenth client also has its deposit disputed.
+fn many_clients_input(clients: u32) -> Vec<u8> {
+    let mut text = String::from("type,client,tx,amount\n");
+    for client in (1..=clients).rev() {
+        text.push_str(&format!("deposit,{client},{},{client}.0\n", 2 * client));
+    }
+    for client in (1..=clients).rev() {
+        text.push_str(&format!("withdrawal,{client},{},0.5\n", 2 * client + 1));
+        if client % 10 == 0 {
+            text.push_str(&format!("dispute,{client},{}\n", 2 * client));
+        }
+    }
+    text.into_bytes()
+}
+
+#[test]
+fn a_large_input_over_many_clients_gives_the_exact_report() {
+    const CLIENTS: u32 = 2_000;
+    let path = input_file("many-clients.csv", &many_clients_input(CLIENTS));
+
+    let mut expected = String::from(HEADER);
+    for client in 1..=CLIENTS {
+        let total = f64::from(client) - 0.5;
+        if client % 10 == 0 {
+            // The deposit is held, so what is left of the withdrawal makes
+            // `available` negative.
+            expected.push_str(&format!(
+                "{client},-0.5000,{client}.0000,{total:.4},false\n"
+            ));
+        } else {
+            expected.push_str(&format!("{client},{total:.4},0.0000,{total:.4},false\n"));
+        }
+    }
+
+    let first = run_on(&path);
+    assert_eq!(first.code, Some(0));
+    assert_eq!(first.stderr, "");
+    assert_eq!(first.stdout, expected);
+    // The order in which each engine lists its accounts (a hash map) differs from
+    // run to run, and the rows are compared in client order.
+    assert_eq!(run_on(&path).stdout, expected);
+}
+
+#[test]
+fn an_error_after_many_valid_rows_still_prints_nothing_to_stdout() {
+    let mut bytes = many_clients_input(2_000);
+    bytes.extend(std::iter::repeat_n(b'a', 5_000));
+    bytes.extend_from_slice(b"\ndeposit,1,999999,1.0\n");
+    let outcome = run_on(&input_file("many-then-oversize.csv", &bytes));
+    assert_eq!(outcome.code, Some(1));
+    assert_eq!(outcome.stdout, "");
+    assert!(
+        outcome.stderr.contains("longer than the allowed maximum"),
+        "stderr: {}",
+        outcome.stderr
+    );
+}
+
 #[test]
 fn a_header_without_the_required_columns_exits_with_1_and_prints_nothing_to_stdout() {
     let outcome = run_on(&input_file("no-header.csv", b"deposit,1,1,1.0\n"));
@@ -297,6 +357,68 @@ fn refused_transactions_are_logged_one_by_one_only_up_to_a_cap() {
     assert_eq!(individual, 20, "stderr: {}", outcome.stderr);
     let summary = line_with(&outcome.stderr, "transactions rejected in total");
     assert!(summary.contains("rejected=30"), "{summary}");
+}
+
+#[test]
+fn refusals_of_many_clients_are_logged_up_to_one_cap_for_the_whole_run() {
+    // Thirty clients, so that the refusals come from different workers whenever
+    // the machine has more than one core.
+    let mut input = String::from("type,client,tx,amount\n");
+    for client in 1..=30 {
+        input.push_str(&format!("withdrawal,{client},{client},1.0\n"));
+    }
+    let outcome = run_on(&input_file(
+        "refusals-of-many-clients.csv",
+        input.as_bytes(),
+    ));
+    assert_eq!(outcome.code, Some(0));
+    let individual = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.contains("transaction rejected"))
+        .count();
+    assert_eq!(individual, 20, "stderr: {}", outcome.stderr);
+    let summary = line_with(&outcome.stderr, "transactions rejected in total");
+    assert!(summary.contains("rejected=30"), "{summary}");
+}
+
+/// Runs the binary on the basic fixture with `TOKIO_WORKER_THREADS` set.
+fn run_basic_with_worker_threads(value: &OsStr) -> Outcome {
+    let output = Command::new(env!("CARGO_BIN_EXE_payments_engine"))
+        .arg(fixture("basic.csv"))
+        .env_remove("RUST_LOG")
+        .env("TOKIO_WORKER_THREADS", value)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+    Outcome {
+        code: output.status.code(),
+        stdout: in_client_order(&String::from_utf8(output.stdout).expect("stdout is UTF-8")),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn a_bad_tokio_worker_threads_value_does_not_crash_the_run() {
+    // Tokio reads this variable unless the worker count is set explicitly, and
+    // it panics on a value it cannot use, which would give exit code 101.
+    let expected = run_on(&fixture("basic.csv"));
+    assert_eq!(expected.code, Some(0));
+    for value in ["", "0", "-1", "abc", "99999999999999999999"] {
+        let outcome = run_basic_with_worker_threads(OsStr::new(value));
+        assert_eq!(outcome.code, Some(0), "value {value:?}: {}", outcome.stderr);
+        assert_eq!(outcome.stdout, expected.stdout, "value {value:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tokio_worker_threads_value_that_is_not_utf8_does_not_crash_the_run() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let outcome = run_basic_with_worker_threads(OsStr::from_bytes(b"\xff\xfe"));
+    assert_eq!(outcome.code, Some(0), "{}", outcome.stderr);
+    assert_eq!(outcome.stdout, run_on(&fixture("basic.csv")).stdout);
 }
 
 #[test]

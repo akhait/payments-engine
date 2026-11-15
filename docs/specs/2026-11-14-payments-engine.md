@@ -170,18 +170,22 @@ Agreed rules and assumptions:
   dropped. An
   I/O error, or a row over the size limit, ends the stream with an error that
   aborts the run with a non-zero exit.
-- Channels are bounded (constant capacity, e.g. 1024 per worker). When a worker
+- Channels are bounded (constant capacity, 1024 per worker in the CLI). When a worker
   is slow its channel fills and `blocking_send` blocks the reader thread
   (backpressure), so the queued transactions stay bounded whatever the size of
   the file. A requested capacity above 1,048,576 is lowered to that, and a
   requested worker count above 65,536 (the number of client ids) to that, so a
   huge request cannot panic the channel or exhaust memory on workers that could
   never receive anything.
-- Worker count `N` is `available_parallelism()`, minimum 1.
+- Worker count `N` is `available_parallelism()`, minimum 1. The Tokio runtime
+  gets the same number of worker threads, set explicitly, so the
+  `TOKIO_WORKER_THREADS` environment variable has no effect.
 - Workers are async tasks looping on `rx.recv().await` and calling the
   synchronous `Engine::apply`. Rejections go to one `RefusalLog` shared by all
   workers (an atomic counter), so the cap on logged refusals holds for the whole
-  run and not per worker (AC 40). A refusal that means the engine's own
+  run and not per worker (AC 40). Workers record concurrently, so with more
+  than one the logged refusals are the first 20 to be recorded, in no fixed
+  order, and not necessarily the first 20 in the input. A refusal that means the engine's own
   balances are inconsistent (`InsufficientHeld`) is the exception: input cannot
   cause it, so it is never held back by the cap and is logged at error level.
   It is still counted: it takes one of the 20 slots if it comes first, and it is
@@ -208,7 +212,9 @@ Agreed rules and assumptions:
   `warn`, overridable with `RUST_LOG`, which names one level (`off`, `error`, `warn`,
   `info`, `debug`, `trace`). Stdout carries nothing but the CSV.
 - Exit codes: `0` success; `1` runtime failure (file cannot be opened, I/O
-  error, worker panic); `2` usage error.
+  error, worker panic or any other pipeline failure); `2` usage error. If the
+  operating system refuses to start a thread, tokio panics and the exit code is
+  101; this is accepted (D23).
 - `run_pipeline` fails with a `PipelineError`: `Read` (the input failed, a row
   was too long, or the header was bad),
   `WorkerPanicked`, `RouterPanicked` (the task reading the input panicked) or
@@ -227,7 +233,8 @@ Crate `payments_engine` (library + binary):
 
 ```
 src/main.rs      CLI parsing, runtime, exit codes
-src/lib.rs       module wiring, public entry point
+src/lib.rs       module wiring, `run` (takes the shard count and channel capacity),
+                 `default_shards` and `DEFAULT_CHANNEL_CAPACITY` (what the CLI passes)
 src/amount.rs    Amount newtype
 src/transaction.rs  raw row, Transaction, TryFrom
 src/account.rs   Account, DepositRecord, DisputeState
@@ -235,16 +242,16 @@ src/engine.rs    Engine, Rejection, rules
 src/pipeline.rs  streaming CSV reader (Transactions)
 src/sharded.rs  router, workers, run_pipeline
 src/refusals.rs  RefusalLog: one cap on refusal logging, shared by workers
-src/test_support.rs  log-capture helper for unit tests (cfg(test) only)
+src/test_support.rs  helpers shared by unit tests: log capture, small builders (cfg(test) only)
 src/output.rs    CSV writer
 tests/           integration tests + fixtures
 ```
 
 Dependencies: `tokio` (`rt-multi-thread`, `sync`), `csv`, `serde`, `tracing`,
 `tracing-subscriber`. The tests also use tokio's `macros` and `time`, and
-`fastrand` for seeded test data (dev-dependencies only); `macros` joins the
-runtime features when the CLI gets `#[tokio::main]`. No others unless a need
-shows up.
+`fastrand` for seeded test data (dev-dependencies only). The CLI builds its
+Tokio runtime by hand, so `macros` stays out of the release build. No others
+unless a need shows up.
 
 ## Acceptance Criteria
 
@@ -370,8 +377,9 @@ Reader robustness
 Command line
 
 40. When the engine refuses a transaction, the system shall log a warning with
-    the client id, the tx id and a fixed reason, the first 20 refusals one by
-    one and then one summary with the total, and shall carry on. The summary is
+    the client id, the tx id and a fixed reason, the first 20 refusals recorded
+    one by one (with several workers, not necessarily the first 20 in the
+    input) and then one summary with the total, and shall carry on. The summary is
     also logged when the run ends in an error. The one exception is a refusal
     that means the engine's own balances are inconsistent, which is never held
     back by the cap and is logged at error level; it still counts towards the
@@ -427,7 +435,21 @@ Failure handling
   is only defined per stream. Deferred, relevant only to the server scenario.
 - **Warning volume.** Capped per stream: the first 20 skipped rows are logged,
   then one summary line (AC 36); refused transactions are capped the same way
-  (AC 40). Both caps are per stream, not per process.
+  (AC 40). Both caps are per stream, not per process. The reader logs skipped
+  rows and the workers log refusals from different threads, so the two kinds of
+  warning are not in input order relative to each other, and refusals are in
+  no fixed order among themselves when there is more than one worker.
+- **Throughput of the concurrent path.** On input that is bound by CSV parsing
+  the concurrent path is slower, and uses more CPU, than a sequential one. Two
+  reviewers timed it independently on a generated file of 3 million rows and
+  5,000 clients (about 90 MB, release build, 10 cores): 2.0 to 2.5 s
+  sequential against 2.4 to 3.0 s concurrent, and 5.3 to 5.5 s of CPU against
+  about 2.1 s. Parsing costs the same in both. The likely cause of the difference
+  is that the concurrent path adds a channel send, and often a thread wake-up,
+  for every row on the reader's critical path, which costs more than the apply
+  work it moves to the workers; it was not confirmed by profiling. Sending
+  batches of rows per message is the likely remedy and is not done (D24). Task
+  10 records time and CPU for its large-input check.
 - **Quoted CSV is not supported.** A quoted field is a bad row and is skipped
   with a warning. Accepted: the format has no field that needs quoting, and
   quote handling lets one stray quote swallow the rows after it.
@@ -445,8 +467,19 @@ Failure handling
 - **Parsing:** rows with padding, missing amount field, malformed rows (AC 4-6),
   using in-memory readers.
 - **Integration:** run the real binary on small hand-written fixtures in
-  `tests/fixtures/`, compare output as a set of rows so row order does not
-  matter; also usage and file-not-found exit codes (AC 1-3, 31).
+  `tests/fixtures/` and compare the rows as a set, because their order is not specified;
+  also usage and file-not-found exit codes (AC 1-3, 31). A file of 2,000
+  clients, listed in descending order, gives exactly the expected rows (AC 31).
+  An oversize row after many valid
+  rows gives exit 1 and nothing on stdout (AC 35), refusals of 30 clients are
+  logged under one cap (AC 40), and a bad `TOKIO_WORKER_THREADS` does not change
+  the exit code. `run` gives the same rows for 1, 2, 3, 8 and 64 workers (AC 27
+  on the CSV), and `report` leaves the output untouched for every kind of
+  pipeline failure. AC 30 is covered piecewise: a panicking worker becomes
+  `WorkerPanicked` (`sharded.rs`), `report` writes nothing for it and keeps its
+  message (`lib.rs`), and `main` gives exit 1 with that message on stderr for
+  every error, which the CLI tests show for read errors. No test makes a worker
+  panic through the binary.
 - **Concurrency:** seeded pseudo-random transaction generator (`fastrand`, a
   dev-dependency); assert 1 worker equals 8 workers (AC 27), per-client ordering
   (AC 28), capacity-1 channel completes (AC 29). Unit tests in `sharded.rs`
@@ -455,8 +488,10 @@ Failure handling
   (AC 43), and the order in which failures are reported.
 - **Logging:** the shared cap and one summary across workers, the summary on a
   read error and on a worker panic, and the error-level exception
-  (`sharded.rs`, `refusals.rs`; AC 40); the skipped-rows summary on an early
-  drop (`pipeline.rs`; AC 36).
+  (`sharded.rs`, `refusals.rs`; AC 40) and through the binary with 30 clients
+  (`tests/cli.rs`, which tells a shared cap from a per-worker one only on a
+  machine with two or more cores); the skipped-rows summary on an early drop
+  (`pipeline.rs`; AC 36).
 - **Invariant check:** `total == available + held` and `held >= 0` for every
   account of generated runs (`every_account_keeps_total_equal_to_available_plus_held`
   in `tests/concurrency.rs`, 10 seeds; AC 32).

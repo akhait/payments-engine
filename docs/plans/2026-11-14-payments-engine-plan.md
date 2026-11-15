@@ -172,7 +172,7 @@ a bad header exits 1 with an error on stderr and nothing on stdout.
 ### Task 8: Sharded concurrent pipeline
 
 **What**: Add `tokio` (`rt-multi-thread`, `sync`; `macros` and `time` are
-dev-only until Task 9). Implement
+dev-only, see D23). Implement
 `run_pipeline(rows: impl Iterator<Item = Result<Transaction, ReadError>> + Send + 'static, shards,
 capacity) -> Result<Vec<(ClientId, Account)>, PipelineError>`: a
 `spawn_blocking` router consumes the iterator and calls
@@ -196,7 +196,8 @@ panicking or early-returning workers, and the public functions wrap it.
 blocking task. A guard aborts the workers when the future is dropped, and every
 1024 transactions routed the router checks that no worker is gone. Refusal logging moves into
 a small `RefusalLog` shared by all workers (one cap of 20 lines and one summary
-whatever the shard count), and the sequential `run` uses it too;
+whatever the shard count), and the sequential `run` of Task 7 uses it too, until
+Task 9 replaces it;
 `Rejection::InsufficientHeld`, which means the engine's bookkeeping is broken,
 is never held back by the cap and is logged at error level (it still counts
 towards the 20). A `Transactions` stream
@@ -221,20 +222,33 @@ worker stops the reader).
 
 ### Task 9: Switch the CLI to the concurrent pipeline and failure handling
 
-**What**: Make `main` a `#[tokio::main]` entry point and have `run` use
-`run_pipeline_from_reader` with `shards = available_parallelism()` (minimum 1)
-and a constant channel capacity (1024). Map `PipelineError` and I/O errors to exit 1
-with a message on stderr and nothing written to stdout (write output only after
-the pipeline has fully succeeded).
-**Files**: `Cargo.toml` (adds the `macros` feature), `src/main.rs`,
-`src/lib.rs`, `tests/cli.rs`
+**What**: Make `run` async, taking the shard count and the channel capacity as
+parameters and calling `run_pipeline_from_reader`, and remove the sequential
+path. Add `default_shards()` (`available_parallelism()`, minimum 1) and
+`DEFAULT_CHANNEL_CAPACITY` (1024), which `main` passes. `RunError::Read` becomes
+`RunError::Pipeline`. `main` builds a multi-thread Tokio runtime by hand, rather
+than with `#[tokio::main]`, with the worker count set explicitly, and blocks on
+`run` (decision D23). Map `PipelineError` and I/O errors to exit 1 with a
+message on stderr and nothing written to stdout (write output only after the
+pipeline has fully succeeded, in a small `report` function).
+**Files**: `src/main.rs`, `src/lib.rs`, `src/sharded.rs` and
+`src/test_support.rs` (the shared test helpers `nz` and `a_read_error`),
+`tests/cli.rs` (`Cargo.toml` does not change: the `macros` feature stays
+dev-only)
 **Depends on**: Tasks 7, 8
-**Verify**: every existing `cargo test --test cli` case still passes unchanged.
-AC 30 is covered in Task 8 by unit tests in `sharded.rs`; Task 9 adds a
-`run`-level test that asserts the error path writes no bytes to the output
-buffer, and decides what the CLI does about a worker that goes away (the
-reader notices within 1024 rows) and about the runtime waiting for blocking
-threads at shutdown.
+**Verify**: every existing `cargo test --test cli` case still passes unchanged,
+and new ones run a 2,000-client file through the binary (the expected rows,
+and nothing on stdout when an oversize row follows the valid rows), check the cap on logged refusals across 30 clients, and check that a bad
+`TOKIO_WORKER_THREADS` does not change the exit code. AC 30 is covered
+piecewise: Task 8 shows by unit tests in `sharded.rs` that a panicking worker
+becomes `WorkerPanicked`; Task 9 adds a `report` test that asserts no bytes are
+written for each kind of `PipelineError`, and `main` gives exit 1 for every
+error, which the CLI tests show for read errors. No test makes a worker panic
+through the binary. A `run` test gives the same report for 1, 2, 3, 8 and 64
+workers (AC 27 on the CSV). A worker that goes away needs nothing more in the
+CLI: it is noticed within 1024 transactions routed (D15) and the run exits 1.
+The runtime has no blocking thread left at shutdown, because `run` awaits the
+reader to its end on every path (D25).
 
 ### Task 10: README and final verification
 
@@ -243,8 +257,11 @@ sharded pipeline), every assumption from the spec, the dispute state machine,
 how correctness is checked (type system, tests, invariants), error handling and
 logging, and the known memory limit of the deposit history. Run a manual
 large-input check: generate several million rows into the scratchpad directory
-(not the repo), run the release build under `/usr/bin/time -l`, and confirm
-memory stays flat. Confirm the repo contains no mention of the company or its
+(not the repo), run the release build under `/usr/bin/time -l`, confirm memory
+stays flat, and record the wall-clock and CPU time next to the figures that
+reviewers reported for the sequential version (D24). The README also says that
+`TOKIO_WORKER_THREADS` has no effect (D23), that warnings are not in input order
+(D24), and what the throughput caveat is. Confirm the repo contains no mention of the company or its
 products and does not contain the challenge PDF.
 **Files**: `README.md`
 **Depends on**: Task 9

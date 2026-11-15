@@ -2,7 +2,23 @@
 
 use std::cell::RefCell;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::sync::Once;
+
+use crate::pipeline::{ReadError, read_transactions};
+
+/// A shard count or channel size from a plain number.
+pub(crate) fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("a non-zero number")
+}
+
+/// A real read error, obtained from input that has no header.
+pub(crate) fn a_read_error() -> ReadError {
+    let Err(error) = read_transactions("deposit,1,1,1.0\n".as_bytes()) else {
+        panic!("input without a header should fail");
+    };
+    error
+}
 
 thread_local! {
     /// What the current thread has logged since `capture_logs` last cleared it.

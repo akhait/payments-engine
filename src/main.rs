@@ -6,7 +6,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use payments_engine::{DEFAULT_LOG_LEVEL, parse_log_level, run};
+use payments_engine::{
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_LOG_LEVEL, default_shards, parse_log_level, run,
+};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -37,7 +39,25 @@ fn say(message: impl fmt::Display) {
 fn run_file(path: &Path) -> Result<(), String> {
     // The path is shown with `{:?}`, which escapes control characters.
     let file = File::open(path).map_err(|error| format!("could not open {path:?}: {error}"))?;
-    run(file, io::stdout().lock()).map_err(|error| error.to_string())
+    // The runtime is built by hand, so that `tokio-macros` stays out of the
+    // release build, and its worker count is set explicitly: left unset, tokio reads
+    // `TOKIO_WORKER_THREADS` and panics on a bad value, which would give exit
+    // code 101. It is the same number as the shard count. `build` has no driver
+    // to fail on here, so its error is a safeguard; if the operating system
+    // refuses a thread, tokio panics instead (see D23).
+    let shards = default_shards();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(shards.get())
+        .build()
+        .map_err(|error| format!("could not start the runtime: {error}"))?;
+    runtime
+        .block_on(run(
+            file,
+            io::stdout().lock(),
+            shards,
+            DEFAULT_CHANNEL_CAPACITY,
+        ))
+        .map_err(|error| error.to_string())
 }
 
 fn init_logging() {
