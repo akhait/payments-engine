@@ -7,6 +7,19 @@ use std::sync::Once;
 
 use crate::pipeline::{ReadError, read_transactions};
 
+/// A destination that always fails, like a full disk.
+pub(crate) struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("disk full"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::other("disk full"))
+    }
+}
+
 /// A shard count or channel size from a plain number.
 pub(crate) fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("a non-zero number")

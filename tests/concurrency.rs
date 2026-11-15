@@ -194,21 +194,85 @@ async fn a_large_input_matches_a_single_engine() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_account_keeps_total_equal_to_available_plus_held() {
+async fn no_account_has_a_negative_hold_or_a_total_that_overflows() {
     for seed in 1..=10 {
         let transactions = generated(seed, 5_000, 20, 60);
         for (client, account) in pipeline(&transactions, 8, 16).await {
-            let sum = account.available().checked_add(account.held());
             assert!(
-                sum.is_some(),
+                account.total().is_some(),
                 "seed {seed}, client {client}: total overflows"
             );
-            assert_eq!(account.total(), sum, "seed {seed}, client {client}");
             assert!(
                 account.held() >= Amount::ZERO,
                 "seed {seed}, client {client}: held is negative"
             );
         }
+    }
+}
+
+/// The CSV the command reads for these transactions.
+fn to_csv(transactions: &[Transaction]) -> String {
+    let mut text = String::from("type,client,tx,amount\n");
+    for transaction in transactions {
+        let row = match transaction {
+            Transaction::Deposit { client, tx, amount } => {
+                format!("deposit,{client},{tx},{amount}\n")
+            }
+            Transaction::Withdrawal { client, tx, amount } => {
+                format!("withdrawal,{client},{tx},{amount}\n")
+            }
+            Transaction::Dispute { client, tx } => format!("dispute,{client},{tx}\n"),
+            Transaction::Resolve { client, tx } => format!("resolve,{client},{tx}\n"),
+            Transaction::Chargeback { client, tx } => format!("chargeback,{client},{tx}\n"),
+        };
+        text.push_str(&row);
+    }
+    text
+}
+
+/// An amount written with four decimals, as a count of ten-thousandths. It is
+/// read here without `Amount`, so that the check below does not rely on it.
+fn ten_thousandths(text: &str) -> i128 {
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, text),
+    };
+    let (whole, fraction) = digits.split_once('.').expect("an amount has a point");
+    assert_eq!(fraction.len(), 4, "{text} has four decimals");
+    let whole: i128 = whole.parse().expect("digits before the point");
+    let fraction: i128 = fraction.parse().expect("digits after the point");
+    sign * (whole * 10_000 + fraction)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_row_of_the_report_has_total_equal_to_available_plus_held() {
+    for seed in 1..=10 {
+        let transactions = generated(seed, 5_000, 20, 60);
+        let mut out = Vec::new();
+        payments_engine::run(
+            Cursor::new(to_csv(&transactions).into_bytes()),
+            &mut out,
+            nz(8),
+            nz(16),
+        )
+        .await
+        .expect("the run succeeds");
+        let report = String::from_utf8(out).expect("the report is UTF-8");
+        let mut lines = report.lines();
+        assert_eq!(lines.next(), Some("client,available,held,total,locked"));
+        let mut rows = 0;
+        for line in lines {
+            let fields: Vec<&str> = line.split(',').collect();
+            assert_eq!(fields.len(), 5, "seed {seed}: {line}");
+            let available = ten_thousandths(fields[1]);
+            let held = ten_thousandths(fields[2]);
+            let total = ten_thousandths(fields[3]);
+            assert_eq!(total, available + held, "seed {seed}: {line}");
+            assert!(held >= 0, "seed {seed}: {line}");
+            assert!(matches!(fields[4], "true" | "false"), "seed {seed}: {line}");
+            rows += 1;
+        }
+        assert!(rows > 0, "seed {seed}: the report has no accounts");
     }
 }
 

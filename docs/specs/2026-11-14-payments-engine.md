@@ -53,7 +53,8 @@ Output would be non-deterministic.
                                                                               ▼
                                                               csv writer ► stdout
 
- All workers also write refusals to one shared refusal log (an atomic counter).
+ The channels carry batches of up to 256 transactions, not single ones (D26). All
+ workers also write refusals to one shared refusal log (an atomic counter).
 ```
 
 Shutdown is driven by channel closure: the reader finishes, its `Sender`s are
@@ -167,8 +168,8 @@ Agreed rules and assumptions:
   blank lines excluded) and a fixed reason, never the row's content, then skip
   it. Only the first 20 skips are logged one by one; after that they are
   counted, and one summary with the total is logged when the stream ends or is
-  dropped. An
-  I/O error, or a row over the size limit, ends the stream with an error that
+  dropped.
+  An I/O error, or a row over the size limit, ends the stream with an error that
   aborts the run with a non-zero exit.
 - Channels are bounded (constant capacity, 1024 per worker in the CLI). When a worker
   is slow its channel fills and `blocking_send` blocks the reader thread
@@ -241,7 +242,7 @@ Agreed rules and assumptions:
 Crate `payments_engine` (library + binary):
 
 ```
-src/main.rs      CLI parsing, runtime, exit codes
+src/main.rs      CLI parsing, RUST_LOG parsing, runtime, exit codes
 src/lib.rs       module wiring, `run` (takes the shard count and channel capacity),
                  `default_shards` and `DEFAULT_CHANNEL_CAPACITY` (what the CLI passes)
 src/amount.rs    Amount newtype
@@ -263,6 +264,10 @@ Tokio runtime by hand, so `macros` stays out of the release build. No others
 unless a need shows up.
 
 ## Acceptance Criteria
+
+A warning for a skipped row or a refused transaction (AC 6, 12, 17, 25) is logged
+individually only up to the caps of AC 36 and AC 40; the rest are counted in the
+summary.
 
 CLI and input
 
@@ -374,9 +379,11 @@ Reader robustness
     or repeats one, then reading shall fail with an error naming the column.
     The columns may come in any order.
 35. If a single row is longer than 1024 bytes, then the system shall process the
-    rows before it, then stop reading with an error.
+    rows before it, then stop reading with an error, after which the run exits
+    with 1 and writes nothing to stdout.
 36. While the input contains many bad rows, the system shall log the first 20
-    individually and then only one summary with the total count.
+    individually and then only one summary with the total count. The summary is
+    logged whenever at least one row was skipped.
 37. The system shall never put the content of a skipped row in a log line.
 38. If the input starts with a UTF-8 byte order mark, then the system shall
     ignore it, however the first reads of the input are split.
@@ -389,7 +396,8 @@ Command line
 40. When the engine refuses a transaction, the system shall log a warning with
     the client id, the tx id and a fixed reason, the first 20 refusals recorded
     one by one (with several workers, not necessarily the first 20 in the
-    input) and then one summary with the total, and shall carry on. The summary is
+    input) and then one summary with the total (whenever at least one was refused), and shall
+    carry on. The summary is
     also logged when the run ends in an error. The one exception is a refusal
     that means the engine's own balances are inconsistent, which is never held
     back by the cap and is logged at error level; it still counts towards the
@@ -427,7 +435,7 @@ Failure handling
   need coordination between workers and make results depend on the worker
   count. Input that reuses an id across clients is accepted for each client.
   Resolved.
-- **Disputes on a locked account.** Assumed allowed (rule 26): freezing stops
+- **Disputes on a locked account.** Assumed allowed (AC 26): freezing stops
   new money moving but does not stop dispute handling. Resolved by default,
   not yet confirmed with a reviewer.
 - **Rejected withdrawal creates an empty account** (rule 7). Resolved by
@@ -459,8 +467,8 @@ Failure handling
   workers (not confirmed by profiling). With batches of 256 it takes 1.7 s and
   2.1 s of CPU, and peaks at 127 MB of memory against 108 MB. The reader, which
   parses the CSV, remains the limit, so this is not a general speed-up: going
-  further would need the parsing itself to run in parallel. Task 10 records
-  time and CPU for its large-input check.
+  further would need the parsing itself to run in parallel. D28 records time and
+  CPU for the large-input check.
 - **Quoted CSV is not supported.** A quoted field is a bad row and is skipped
   with a warning. Accepted: the format has no field that needs quoting, and
   quote handling lets one stray quote swallow the rows after it.
@@ -499,13 +507,26 @@ Failure handling
   panic and early stop (AC 30), dropped future (AC 42) and vanished worker
   (AC 43), and the order in which failures are reported.
 - **Logging:** the shared cap and one summary across workers, the summary on a
-  read error and on a worker panic, and the error-level exception
-  (`sharded.rs`, `refusals.rs`; AC 40) and through the binary with 30 clients
+  read error and on a worker panic (`sharded.rs`), the error-level exception
+  (`refusals.rs`; AC 40) and through the binary with 30 clients
   (`tests/cli.rs`, which tells a shared cap from a per-worker one only on a
   machine with two or more cores); the skipped-rows summary on an early drop
   (`pipeline.rs`; AC 36).
-- **Invariant check:** `total == available + held` and `held >= 0` for every
-  account of generated runs (`every_account_keeps_total_equal_to_available_plus_held`
-  in `tests/concurrency.rs`, 10 seeds; AC 32).
-- **Hygiene:** `cargo fmt --check` and `cargo clippy -- -D warnings` clean;
-  all tests hermetic and fast.
+- **Invariant check:** on generated runs, every row of the CSV report has
+  `total == available + held`, checked on the text with a parser that does not
+  use `Amount` (`every_row_of_the_report_has_total_equal_to_available_plus_held`
+  in `tests/concurrency.rs`, 10 seeds; AC 32), and every account has `held >= 0`
+  and a total that does not overflow
+  (`no_account_has_a_negative_hold_or_a_total_that_overflows`).
+- **Reader and command-line criteria:** the header rules (AC 34) by
+  `input_whose_header_lacks_a_required_column_is_rejected` and
+  `reads_columns_in_any_order`; no row content in a log line (AC 37) by
+  `logs_a_fixed_reason_and_never_the_row_content`; the byte order mark (AC 38) by
+  `a_byte_order_mark_is_ignored_however_the_input_is_split`; rows that stop
+  before extra header columns (AC 39) by
+  `rows_that_stop_before_extra_header_columns_are_still_read`; and the exit code
+  with an unwritable stderr (AC 41) by the `an_unwritable_stderr_*` tests in
+  `tests/cli.rs`. The header width does not change the work for a row
+  (`a_row_is_narrowed_to_the_four_required_columns_whatever_the_header_width`).
+- **Hygiene:** `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
+  clean; all tests hermetic and fast.

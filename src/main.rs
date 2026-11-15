@@ -6,9 +6,12 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use payments_engine::{
-    DEFAULT_CHANNEL_CAPACITY, DEFAULT_LOG_LEVEL, default_shards, parse_log_level, run,
-};
+use tracing::level_filters::LevelFilter;
+
+use payments_engine::{DEFAULT_CHANNEL_CAPACITY, default_shards, run};
+
+/// The log level when `RUST_LOG` does not name one.
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::WARN;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -51,12 +54,7 @@ fn run_file(path: &Path) -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not start the runtime: {error}"))?;
     runtime
-        .block_on(run(
-            file,
-            io::stdout().lock(),
-            shards,
-            DEFAULT_CHANNEL_CAPACITY,
-        ))
+        .block_on(run(file, io::stdout(), shards, DEFAULT_CHANNEL_CAPACITY))
         .map_err(|error| error.to_string())
 }
 
@@ -86,4 +84,50 @@ fn init_logging() {
         .log_internal_errors(false)
         .with_max_level(level)
         .init();
+}
+
+/// The level a `RUST_LOG` value names: one of `off`, `error`, `warn`, `info`,
+/// `debug` and `trace`, in any case.
+///
+/// Numbers, which tracing's own parser also accepts, are not level names here.
+pub fn parse_log_level(value: &str) -> Option<LevelFilter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(LevelFilter::OFF),
+        "error" => Some(LevelFilter::ERROR),
+        "warn" => Some(LevelFilter::WARN),
+        "info" => Some(LevelFilter::INFO),
+        "debug" => Some(LevelFilter::DEBUG),
+        "trace" => Some(LevelFilter::TRACE),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_level_names_rust_log_may_hold() {
+        let cases = [
+            ("off", Some(LevelFilter::OFF)),
+            ("error", Some(LevelFilter::ERROR)),
+            ("warn", Some(LevelFilter::WARN)),
+            ("info", Some(LevelFilter::INFO)),
+            ("debug", Some(LevelFilter::DEBUG)),
+            ("trace", Some(LevelFilter::TRACE)),
+            (" DEBUG ", Some(LevelFilter::DEBUG)),
+            ("", None),
+            ("bogus", None),
+            ("info,payments_engine=debug", None),
+            ("Off", Some(LevelFilter::OFF)),
+            ("WARN", Some(LevelFilter::WARN)),
+            ("0", None),
+            ("1", None),
+            ("+3", None),
+            ("9", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(parse_log_level(value), expected, "value {value:?}");
+        }
+    }
 }

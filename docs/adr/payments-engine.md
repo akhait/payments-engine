@@ -7,7 +7,8 @@ This is the project's decision log (an ADR). Entries up to and including Task 6
 were written before the log adopted numbered entries, and are kept as written.
 From Task 7 on, entries are numbered `D1`, `D2`, ... and are append-only: a later
 decision that reverses an earlier one is a new entry, and the old one is marked
-as superseded.
+as superseded. The exception is a correction made while the task is still under
+review, which is made in place and says so (D23).
 
 ## 2026-11-14: Task 1: Crate scaffold and `Amount`
 
@@ -50,7 +51,8 @@ mutants tried afterwards are killed.
 
 **Open**: the reviewers noted that `serde`'s `derive` feature pulls in `syn`
 3.0.10, a brand-new major version. Consider an advisory scan (`cargo audit` or
-`cargo deny`) before submitting; neither tool is installed locally.
+`cargo deny`) before submitting; neither tool is installed locally. (See D31 for
+what was done at the end.)
 
 ## 2026-11-14: Task 2: Engine with deposits and withdrawals
 
@@ -106,7 +108,7 @@ ids are logged for reconciliation. `u64` cannot represent the negative
 roughly doubles the deposit history, the one structure that can grow to
 billions of entries. Because `Amount` is a sealed newtype, switching later is a
 change inside `amount.rs` only.
-**To do**: state the limit in the README (Task 10).
+**To do**: state the limit in the README (Task 10). Done.
 
 **Decision**: Tests build amounts with a test-only `Amount::from_units(i64)`
 (raw ten-thousandths) instead of parsing strings through `amt()` / `negative()`
@@ -274,7 +276,8 @@ and dropped the 5 silently. A missing or differently cased header used to
 `syn`. Task 7 needs `tracing-subscriber` for real: move it to the normal
 dependencies with the `env-filter` feature, at version 0.3.20 or later
 (RUSTSEC-2025-0055, ANSI escape log poisoning, is fixed from 0.3.20; 0.3.23 is
-locked).
+locked). Superseded by D1 and D5: only the `fmt` and `std` features are used, and
+`env-filter` is not.
 
 **Known limits**: A truncated final row is read as complete. `Trim::All` makes csv copy
 each record, so the buffer is not allocation-free (memory is bounded by the row
@@ -497,7 +500,7 @@ Inline spec check, quality gates and mutation checks only.
 ## D18 — 2026-11-14 — Task 8: Sharded concurrent pipeline
 
 **Status**: Accepted
-**Decision**: The generator of the concurrency tests makes chargebacks about 3% of the rows, and a test checks that at least a quarter of the generated transactions are applied and that some but not all accounts end up locked.
+**Decision**: The generator of the concurrency tests makes chargebacks about 3% of the rows, and a test checks that at least a quarter of the generated transactions are applied and that some but not all accounts end up locked. (D21 lowers the floor to 20%, over twelve seeds.)
 **Reason**: A chargeback locks an account for good, and a locked account refuses the rest of its deposits and withdrawals, so too many chargebacks leave a run with little left to compare between worker counts. The first weights made them 8% of the rows. With 3%, about a third of the generated transactions are applied and 8 of 12 accounts end locked (seed 1, 3,000 rows), which the test pins as a floor (the figures are for the first, hand-written generator; see D21 for the current ones).
 **Alternatives considered**: Leaving the weights and trusting the comparison.
 
@@ -511,7 +514,7 @@ Inline spec check, quality gates and mutation checks only.
 ## D20 — 2026-11-14 — Task 8: Sharded concurrent pipeline
 
 **Status**: Open
-**Decision**: The randomized tests compare the sharded pipeline with a single `Engine` fed the same transactions. They do not compare the engine with an independent model of the rules, which the "Open for Task 8" note under Task 5 asked for (an `i128` reference model); no such model exists in the suite.
+**Decision**: The randomized tests compare the sharded pipeline with a single `Engine` fed the same transactions. They do not compare the engine with an independent model of the rules, which the "Open for Task 8" note under Task 3 asked for (an `i128` reference model); no such model exists in the suite.
 **Reason**: Comparing with one `Engine` proves that sharding changes nothing, which is what Task 8 adds. The rules themselves are covered by the table-driven tests of Tasks 2 to 4, and a reference model would be a second implementation of them. Nobody has decided whether it is worth building.
 **Alternatives considered**: Building the reference model in Task 8, which would grow a task about concurrency into one about the rules.
 
@@ -579,7 +582,7 @@ From 64 up the time is the same within noise, so 256 sits on the plateau, with C
 **Status**: Accepted
 **Decision**: The spec, the plan and this decision log stay in the repository, and the README points to them in a section on how the project was built.
 **Reason**: The author wants a reviewer to be able to follow the way the work was done: the spec before the code, the plan with a commit for each task, the decisions with their alternatives, and what the independent reviews found. The documents are written in the author's own words and do not reproduce the task statement or its example rows.
-**Alternatives considered**: Removing them before submission, which was the plan's default at the end of Task 10.
+**Alternatives considered**: Removing the plan, and possibly the spec, at the end, which is the default of the cleanup step of the review process.
 
 ## D28 — 2026-11-15 — Task 10: README and final verification
 
@@ -596,3 +599,28 @@ From 64 up the time is the same within noise, so 256 sits on the plateau, with C
 
 The sequential build (commit `a327fa2`) took 6.74 s and 422 MB on the 9-million-row file with deposits, and 5.07 s and 3 MB on the one without. Memory therefore does not depend on the size of the input: the file with no deposits peaks at 4 MB however long it is. It grows with the number of deposits recorded, at roughly 45 to 105 bytes each (about 100 bytes at the largest size, where about 5 million deposits are recorded), and the concurrent build uses about 100 MB more than the sequential one at that size. The concurrent build is faster on the largest file (5.3 s against 6.7 s) and the same where nothing is applied, because parsing is the limit there.
 **Alternatives considered**: Not measuring a file larger than 3 million rows, which would have left the growth with deposits unquantified.
+
+## D29 — 2026-11-15 — Final review: the cost of a row does not depend on the header
+
+**Status**: Accepted
+**Decision**: The positions of the four required columns are found once, and each row is cut down to those four fields before it is parsed. The header may still have any number of other columns, which are ignored.
+**Reason**: The security review of the whole branch found that every row was padded with empty fields up to the width of the header and then walked field by field by the deserializer, so the cost of a row grew with the number of header columns, which the input chooses. A header can have about 500 extra columns within the 1024-byte limit (one-character names). I measured one million one-byte rows with such a header: 5.15 s before and 0.57 s after, the same as with an ordinary four-column header (0.57 s). The reviewer measured about 100 times the cost per byte on a 10 MB file. The behavior is unchanged: every parsing test passed untouched, a new test pins the narrowing, and mutants that read the wrong column, accept a row wider than the header, or fail on a short row are killed.
+**Alternatives considered**: Rejecting headers wider than some number of columns, which would change the documented rule that other columns are ignored; reading the fields by index without serde, which gives up the shared deserialization of an amount.
+
+## D30 — 2026-11-15 — Final review: a smaller public surface
+
+**Status**: Accepted
+**Decision**: `DisputeState`, `DepositRecord` and `BalanceError` are `pub(crate)`; `Engine::account` exists only for tests; the parsing of `RUST_LOG` and its default level moved from the library into `main.rs`, so the library no longer exposes a `tracing` type. The manifest has `publish = false` and forbids unsafe code for every target, tests included (`[lints.rust] unsafe_code = "forbid"`), besides the attribute in the two crate roots. The binary now writes to `io::stdout()` instead of holding its lock for the whole run.
+**Reason**: Nothing public took or returned those types, and each public item is surface that a library meant to sit behind a server has to keep. The lock was held for the whole run for no purpose, and a later `println!` in another thread would have deadlocked on it.
+**Alternatives considered**: Leaving the items public, which costs nothing now and something later.
+
+## D31 — 2026-11-15 — Final review of the whole branch
+
+**Status**: Accepted
+**Decision**: The branch got a last review before it was finished, because one task (the output writer) had never been reviewed on its own: a code review, a security review, a documentation review and an audit of the acceptance criteria against the code and tests. None of them found a blocking problem. What was done with what they found:
+- **Fixed in code or tests**: the cost of a row (D29); a CSV error from the writer lost the kind of its I/O error and nothing tested it (it now keeps it, and a test writes enough rows to show it); the test that was meant to check `total == available + held` could not fail, because `total()` is defined that way, so it was renamed to what it checks and a new test parses every row of the report with an independent parser and checks the sum (AC 32); a dispute whose subtraction underflows (AC 9) and the bound of 1024 rows for a vanished worker on a shard the input never names (AC 43) had no test, and now have; the public surface (D30); the writer computes each total once; doc comments list the errors of `hold` and `release`.
+- **Fixed in the documents**: several decision-log pointers (D18, D20, D27, the Task 5 entry on `env-filter`); plan text for Tasks 7, 8 and 10 and the list of follow-up commits; acceptance criteria whose wording ignored the caps on logging and the exit code after an oversize row; the Testing section of the spec, which now maps AC 34, 37, 38, 39 and 41 to tests and describes the invariant check as it is.
+- **Left as it is, on purpose**: the error types print their cause in `Display` and also return it from `source()`, so a reporter that prints the whole chain would show it more than once (`main` prints `Display` only; fixing it means choosing one place for the cause in each layer); two byte order marks at the start of a file are accepted, because the wrapper skips one and the csv crate a second; no test makes a worker panic through the binary (AC 30 is covered in pieces, and a reviewer showed by injecting a panic that the binary exits 1 with nothing on stdout); the Task 6 writer's rows are still built from strings.
+- **Supply chain**: neither `cargo audit` nor `cargo deny` is installed. The security reviewer compared the RustSec advisory database (commit 02e2517f, 15 November 2026) with `Cargo.lock` by hand: no applicable advisory and no yanked version among the 24 locked crates. That is not the same as an automated run, which the README says. `syn` 3.0.10 and `itoa` 1.0.19 were published on 9 November 2026, six days before the review, and no release cooldown was applied. A secret scan ran as a pre-commit check on every commit, and the reviewer scanned the whole history with 0 findings.
+**Reason**: The per-task reviews cannot see how modules fit together, what a later task made dead, or what no task reviewed.
+**Alternatives considered**: Skipping the review of the tasks that had already been reviewed, which would have missed the header-width cost (found only when the whole reader was read as one) and the vacuous invariant test.

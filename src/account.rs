@@ -4,7 +4,7 @@ use crate::amount::Amount;
 
 /// Why a balance change was refused. The account is left unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BalanceError {
+pub(crate) enum BalanceError {
     /// The amount to add or remove was zero or negative.
     NonPositiveAmount,
     /// The account is locked, so funds can no longer move in or out.
@@ -117,6 +117,10 @@ impl Account {
     ///
     /// Available may become negative; the total does not change. Allowed on a
     /// locked account: the lock only stops deposits and withdrawals.
+    ///
+    /// Fails with [`BalanceError::NonPositiveAmount`] if `amount` is not
+    /// positive, and with [`BalanceError::Overflow`] if either balance would not
+    /// fit (available below the smallest amount, or held above the largest).
     pub(crate) fn hold(&mut self, amount: Amount) -> Result<(), BalanceError> {
         ensure_positive(amount)?;
         // Work out both new balances before storing either, so a failure on the
@@ -137,8 +141,10 @@ impl Account {
     /// Moves `amount` from held back to available, when a dispute is resolved.
     ///
     /// Fails with [`BalanceError::InsufficientHeld`] if less than `amount` is
-    /// held, so the held balance can never go negative. Allowed on a locked
-    /// account.
+    /// held, so the held balance can never go negative. Also fails with
+    /// [`BalanceError::NonPositiveAmount`] if `amount` is not positive, and with
+    /// [`BalanceError::Overflow`] if available would not fit the result. Allowed
+    /// on a locked account.
     pub(crate) fn release(&mut self, amount: Amount) -> Result<(), BalanceError> {
         ensure_positive(amount)?;
         let held = self
@@ -189,7 +195,7 @@ fn ensure_positive(amount: Amount) -> Result<(), BalanceError> {
 
 /// Where a deposit stands in the dispute process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisputeState {
+pub(crate) enum DisputeState {
     /// Not disputed, or a dispute that was resolved.
     Normal,
     /// The funds are currently held.
@@ -203,9 +209,9 @@ pub enum DisputeState {
 /// The engine stores it under the deposit's `(client, tx)` pair, so the client
 /// is part of the key and not repeated here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DepositRecord {
-    pub amount: Amount,
-    pub state: DisputeState,
+pub(crate) struct DepositRecord {
+    pub(crate) amount: Amount,
+    pub(crate) state: DisputeState,
 }
 
 #[cfg(test)]

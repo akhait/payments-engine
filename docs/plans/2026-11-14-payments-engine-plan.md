@@ -10,7 +10,7 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 
 - Every task is done test-first (RED, GREEN, REFACTOR).
 - A task is finished only when `cargo test`, `cargo fmt --check` and
-  `cargo clippy -- -D warnings` are all clean.
+  `cargo clippy --all-targets -- -D warnings` are all clean.
 - Tasks 1-4 build the synchronous core, which is the heart of the solution.
   Tokio does not appear until Task 8, so the rules are proven before
   concurrency is added.
@@ -33,9 +33,11 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 
 Follow-up commits that belong to finished tasks: `477aa49` (tests build amounts
 from raw units), `acfb739` (the output writer checks totals with
-`try_for_each`), the commit "test(concurrency): generate test input with
-fastrand" and the commit "feat(pipeline): send transactions to the workers in
-batches" (D26).
+`try_for_each`), `27f66e0` (the concurrency tests generate input with
+`fastrand`), `9eddeff` (transactions go to the workers in batches, D26) and the
+commit "fix: act on the final review" (D29 to D31). The commits named
+`docs(plans): ...`, and the one that added this plan, only record progress or
+move documents, and are not listed.
 
 ## Tasks
 
@@ -99,7 +101,7 @@ held 5, total 5; a dispute on another client's tx changes nothing; after
 **What**: Implement chargeback (same-client `Disputed` deposit; held decreases;
 state becomes `ChargedBack`; account locked). Add the locked-account check to
 deposit and withdrawal (`Rejection::AccountLocked`). Dispute, resolve and
-chargeback remain allowed on a locked account for its other deposits (rule 26).
+chargeback remain allowed on a locked account for its other deposits (AC 26).
 Remove the `Unsupported` placeholder.
 **Files**: `src/engine.rs`, `src/account.rs` (adds `charge_back` and the lock
 rule)
@@ -163,10 +165,11 @@ single-threaded.
 **Depends on**: Tasks 4, 5, 6
 **Verify**: `cargo test --test cli` passes AC 1, 2 and 3 (stdout holds only
 CSV; no args and two args exit 2 with empty stdout; missing file exits 1 with
-empty stdout), plus fixture runs comparing output as an unordered set of rows
-(so row order does not matter). `cargo run -- tests/fixtures/basic.csv` shows
+empty stdout), plus fixture runs comparing the rows as a set (their order is unspecified).
+`cargo run -- tests/fixtures/basic.csv` shows
 the expected accounts. Also checks stderr at the CLI level: a bad row is logged
-with its data-row number (the fixture has CRLF line endings and blank lines) and
+with its data-row number (the fixture has blank lines, and a CRLF copy is
+generated in the test, D7) and
 a fixed reason, never its content; a clean run logs nothing; an oversize row or
 a bad header exits 1 with an error on stderr and nothing on stdout.
 
@@ -208,6 +211,10 @@ it.
 **Files**: `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/sharded.rs` (new),
 `src/refusals.rs` (new), `src/test_support.rs` (new, tests only),
 `src/pipeline.rs` (a `Drop` for `Transactions`, and tests), `tests/concurrency.rs`
+**Delivered as**: the router buffers each shard's transactions and sends them in
+batches of up to 256 (`BATCH_SIZE`), not one message per transaction, as the first
+version did; see the follow-up commit "feat(pipeline): send transactions to the
+workers in batches" and D26.
 **Depends on**: Tasks 4, 5 and 7 (it uses `Engine::into_accounts` and
 `Transaction::client` and `tx`)
 **Verify**: `cargo test --test concurrency` passes AC 27 (1 worker and 8
@@ -258,8 +265,10 @@ sharded pipeline), every assumption from the spec, the dispute state machine,
 how correctness is checked (type system, tests, invariants), error handling and
 logging, and the known memory limit of the deposit history. Run a manual
 large-input check: generate several million rows into the scratchpad directory
-(not the repo), run the release build under `/usr/bin/time -l`, confirm memory
-stays flat, and record the wall-clock and CPU time next to the figures in D26.
+(not the repo), run the release build, confirm that memory does not depend on the
+size of the input (it grows with the number of deposits recorded, and stays at a
+few megabytes when none are), and record the wall-clock and CPU time (D28, next
+to the figures in D26).
 The README also says that `TOKIO_WORKER_THREADS` has no effect (D23), that
 warnings are not in input order (D24), and how the throughput was measured and
 what limits it (D26). Confirm the repo contains no mention of the company or its
@@ -268,7 +277,11 @@ products and does not contain the challenge PDF.
 **Depends on**: Task 9
 **Verify**: AC 33 (README covers assumptions, architecture, tests, error
 handling). `cargo build --release` succeeds; `cargo test`, `cargo fmt --check`
-and `cargo clippy -- -D warnings` are clean; the large run finishes with
-bounded peak memory; a case-insensitive search of the repo (excluding
+and `cargo clippy --all-targets -- -D warnings` are clean; the large run finishes
+with peak memory that follows the number of deposits, not the size of the file; a case-insensitive search of the repo (excluding
 `target/`) for the company and brand names listed in the brief finds nothing,
 and `git ls-files` shows no PDF.
+**Status**: Complete
+**Delivered as**: `README.md`, the example in it as `tests/fixtures/example.csv`
+with a test that checks the README and the binary agree, and decisions D27 and
+D28. The final review of the whole branch followed; its outcome is D29 to D31.

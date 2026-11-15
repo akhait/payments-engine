@@ -547,6 +547,7 @@ mod tests {
         assert_eq!(received, 100);
         assert!(router.join().expect("the router thread"));
     }
+
     #[test]
     fn route_stops_at_the_first_error_and_reports_it_after_sending_what_it_had_read() {
         let rows = vec![Ok(deposit(1, 1)), Err(a_read_error()), Ok(deposit(1, 2))];
@@ -620,6 +621,7 @@ mod tests {
         assert!(matches!(result, Err(RouteError::WorkerGone)));
         assert_eq!(produced.load(Ordering::SeqCst), 3);
     }
+
     #[test]
     fn route_stops_at_the_next_full_batch_when_the_worker_of_the_shard_is_gone() {
         for batch in [1, 4, BATCH_SIZE] {
@@ -698,6 +700,14 @@ mod tests {
         let received: usize = batches_in(&mut inbox).iter().map(Vec::len).sum();
         assert_eq!(received, 100);
         assert!(router.join().expect("the router thread"));
+    }
+
+    #[test]
+    fn the_limits_are_the_documented_ones() {
+        assert_eq!(BATCH_SIZE, 256);
+        assert_eq!(LIVENESS_CHECK_INTERVAL, 1024);
+        assert_eq!(MAX_SHARDS, 65_536);
+        assert_eq!(MAX_CAPACITY, 1_048_576);
     }
 
     #[test]
@@ -1010,6 +1020,39 @@ mod tests {
             matches!(result, Err(PipelineError::Stopped)),
             "got {result:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_that_is_gone_on_a_shard_the_input_never_names_stops_the_run() {
+        // Every row belongs to client 1, which sits on shard 1 of 2. Shard 0's
+        // worker is gone before the router starts, and nothing is ever sent to it,
+        // so only the periodic check can find out.
+        let produced = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&produced);
+        let rows = (1..=100_000u32).map(move |tx| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(deposit(1, tx))
+        });
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let result = within(run_with_workers(
+            opened(rows),
+            nz(2),
+            nz(1024),
+            move |inbox, refusals| {
+                if spawned.fetch_add(1, Ordering::SeqCst) == 0 {
+                    drop(inbox);
+                    tokio::spawn(async { Engine::default() })
+                } else {
+                    tokio::spawn(worker(inbox, refusals))
+                }
+            },
+        ))
+        .await;
+        assert!(
+            matches!(result, Err(PipelineError::Stopped)),
+            "got {result:?}"
+        );
+        assert_eq!(produced.load(Ordering::SeqCst), 1024);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

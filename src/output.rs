@@ -49,7 +49,12 @@ impl From<io::Error> for WriteError {
 
 impl From<csv::Error> for WriteError {
     fn from(error: csv::Error) -> Self {
-        Self::Io(error.into())
+        // Writing rows of text can only fail in the destination, so the cause is
+        // an I/O error, and it keeps its kind (a broken pipe stays one).
+        match error.into_kind() {
+            csv::ErrorKind::Io(error) => Self::Io(error),
+            other => Self::Io(io::Error::other(format!("{other:?}"))),
+        }
     }
 }
 
@@ -63,20 +68,21 @@ pub fn write_accounts<W: Write>(
 ) -> Result<(), WriteError> {
     let accounts: Vec<(ClientId, Account)> = accounts.into_iter().collect();
 
-    // Check every total before writing anything, so that a failure leaves the
+    // Work out every total before writing anything, so that a failure leaves the
     // output untouched instead of half a report.
-    accounts
+    let rows = accounts
         .iter()
-        .try_for_each(|(client, account)| total_of(*client, account).map(|_| ()))?;
+        .map(|(client, account)| total_of(*client, account).map(|total| (*client, account, total)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut writer = csv::Writer::from_writer(out);
     writer.write_record(COLUMNS)?;
-    for (client, account) in &accounts {
+    for (client, account, total) in rows {
         writer.write_record([
             client.to_string(),
             account.available().to_string(),
             account.held().to_string(),
-            total_of(*client, account)?.to_string(),
+            total.to_string(),
             account.is_locked().to_string(),
         ])?;
     }
@@ -93,6 +99,7 @@ fn total_of(client: ClientId, account: &Account) -> Result<Amount, WriteError> {
 mod tests {
     use super::*;
     use crate::amount::Amount;
+    use crate::test_support::FailingWriter;
 
     // Amounts are written in ten-thousandths: 10_000 is 1.0, 15_000 is 1.5.
 
@@ -109,19 +116,6 @@ mod tests {
         let mut out = Vec::new();
         write_accounts(&mut out, accounts).expect("the report is written");
         String::from_utf8(out).expect("the report is UTF-8")
-    }
-
-    /// A destination that always fails, like a full disk.
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("disk full"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::other("disk full"))
-        }
     }
 
     #[test]
@@ -198,6 +192,32 @@ mod tests {
         let result = write_accounts(&mut out, vec![(1, account(10_000, 0, false)), (7, broken)]);
         assert!(matches!(result, Err(WriteError::TotalOverflow(7))));
         assert!(out.is_empty(), "wrote {} bytes", out.len());
+    }
+
+    /// A destination whose pipe is broken, to tell its error from any other.
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn a_failure_in_the_middle_of_a_large_report_keeps_its_kind() {
+        // More rows than the csv writer buffers, so the failure shows while rows
+        // are being written and not only at the final flush.
+        let accounts: Vec<_> = (0..5_000u16)
+            .map(|client| (client, account(10_000, 0, false)))
+            .collect();
+        match write_accounts(BrokenPipe, accounts) {
+            Err(WriteError::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+            other => panic!("expected an I/O error, got {other:?}"),
+        }
     }
 
     #[test]

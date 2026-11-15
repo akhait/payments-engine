@@ -15,15 +15,10 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 
-use tracing::level_filters::LevelFilter;
-
 use crate::account::Account;
 use crate::output::{WriteError, write_accounts};
 use crate::sharded::{PipelineError, run_pipeline_from_reader};
 use crate::transaction::ClientId;
-
-/// The log level when `RUST_LOG` does not name one.
-pub const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::WARN;
 
 /// How many transactions each worker's channel holds when the command line
 /// runs the pipeline.
@@ -68,7 +63,7 @@ impl std::error::Error for RunError {
 /// Nothing is written unless the whole input could be read and every worker
 /// finished. A failure while writing the report can still leave part of it
 /// behind. A transaction the engine refuses is logged and does not stop the
-/// run. Each worker's channel holds `capacity` transactions. `shards` and
+/// run. Each worker's channel holds at most `capacity` transactions. `shards` and
 /// `capacity` are lowered to the maxima that
 /// [`run_pipeline`](crate::sharded::run_pipeline) documents.
 ///
@@ -101,29 +96,13 @@ fn report<W: Write>(
     write_accounts(output, accounts).map_err(RunError::Write)
 }
 
-/// The level a `RUST_LOG` value names: one of `off`, `error`, `warn`, `info`,
-/// `debug` and `trace`, in any case.
-///
-/// Numbers, which tracing's own parser also accepts, are not level names here.
-pub fn parse_log_level(value: &str) -> Option<LevelFilter> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "off" => Some(LevelFilter::OFF),
-        "error" => Some(LevelFilter::ERROR),
-        "warn" => Some(LevelFilter::WARN),
-        "info" => Some(LevelFilter::INFO),
-        "debug" => Some(LevelFilter::DEBUG),
-        "trace" => Some(LevelFilter::TRACE),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Cursor};
+    use std::io::Cursor;
 
     use super::*;
     use crate::pipeline::MAX_ROW_BYTES;
-    use crate::test_support::{a_read_error, nz};
+    use crate::test_support::{FailingWriter, a_read_error, nz};
 
     const HEADER: &str = "type,client,tx,amount\n";
     const REPORT_HEADER: &str = "client,available,held,total,locked\n";
@@ -166,18 +145,6 @@ mod tests {
 
     async fn run_to_string(input: &str) -> Result<String, RunError> {
         run_with_shards(input, 4).await
-    }
-
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("disk full"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::other("disk full"))
-        }
     }
 
     #[tokio::test]
@@ -328,35 +295,5 @@ mod tests {
             let report = run_with_shards(&input, shards).await.unwrap();
             assert_eq!(report, one, "{shards} shards");
         }
-    }
-
-    #[test]
-    fn parses_the_level_names_rust_log_may_hold() {
-        let cases = [
-            ("off", Some(LevelFilter::OFF)),
-            ("error", Some(LevelFilter::ERROR)),
-            ("warn", Some(LevelFilter::WARN)),
-            ("info", Some(LevelFilter::INFO)),
-            ("debug", Some(LevelFilter::DEBUG)),
-            ("trace", Some(LevelFilter::TRACE)),
-            (" DEBUG ", Some(LevelFilter::DEBUG)),
-            ("", None),
-            ("bogus", None),
-            ("info,payments_engine=debug", None),
-            ("Off", Some(LevelFilter::OFF)),
-            ("WARN", Some(LevelFilter::WARN)),
-            ("0", None),
-            ("1", None),
-            ("+3", None),
-            ("9", None),
-        ];
-        for (value, expected) in cases {
-            assert_eq!(parse_log_level(value), expected, "value {value:?}");
-        }
-    }
-
-    #[test]
-    fn the_default_log_level_is_warn() {
-        assert_eq!(DEFAULT_LOG_LEVEL, LevelFilter::WARN);
     }
 }

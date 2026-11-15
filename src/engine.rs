@@ -84,7 +84,8 @@ pub struct Engine {
 
 impl Engine {
     /// Looks up a client's account, if the client has appeared.
-    pub fn account(&self, client: ClientId) -> Option<&Account> {
+    #[cfg(test)]
+    pub(crate) fn account(&self, client: ClientId) -> Option<&Account> {
         self.accounts.get(&client)
     }
 
@@ -506,6 +507,30 @@ mod tests {
         assert_balances(&engine, 1, 0, i64::MAX);
         assert_eq!(engine.apply(dispute(1, 3)), Err(Rejection::Overflow));
         assert_balances(&engine, 1, 0, i64::MAX);
+        // The refused dispute must not have marked deposit 3 as disputed.
+        assert_eq!(engine.apply(resolve(1, 3)), Err(Rejection::NotUnderDispute));
+    }
+
+    #[test]
+    fn dispute_that_would_underflow_available_is_rejected_and_state_is_unchanged() {
+        // Charging back a deposit that was already withdrawn leaves available at
+        // -MAX on a locked account, and disputing another deposit of MAX would
+        // push it past the smallest amount.
+        let mut engine = Engine::default();
+        apply_all(
+            &mut engine,
+            &[
+                deposit(1, 1, i64::MAX),
+                withdrawal(1, 2, i64::MAX),
+                deposit(1, 3, i64::MAX),
+                withdrawal(1, 4, i64::MAX),
+                dispute(1, 1),
+                chargeback(1, 1),
+            ],
+        );
+        assert_balances(&engine, 1, -i64::MAX, 0);
+        assert_eq!(engine.apply(dispute(1, 3)), Err(Rejection::Overflow));
+        assert_balances(&engine, 1, -i64::MAX, 0);
         // The refused dispute must not have marked deposit 3 as disputed.
         assert_eq!(engine.apply(resolve(1, 3)), Err(Rejection::NotUnderDispute));
     }

@@ -157,9 +157,10 @@ These are the choices the rules above leave open. The spec in
    largest amount is 922,337,203,685,477.5807, the `i64` range at four decimals).
    An input amount above that is a bad row. Every operation uses checked
    arithmetic, including `available + held`, and a transaction whose result would
-   overflow is refused.
+   overflow is refused. The largest amount has 19 significant digits, more than a
+   spreadsheet or a floating-point reader keeps exactly.
 10. **Bad input does not abort the run**, except for what makes the input
-    unreadable: a bad or missing header, a row longer than 1024 bytes, or a
+    unreadable: a bad header, a row longer than 1024 bytes, or a
     failing read. A bad row is skipped with a warning.
 11. **A final row without a line ending is accepted** as if it were complete. CSV
     cannot tell a cut-off row from a finished one, so a connection that drops
@@ -233,7 +234,9 @@ These are the choices the rules above leave open. The spec in
 | `src/sharded.rs` | the router, the workers, `run_pipeline` and its failures |
 | `src/refusals.rs` | the shared cap on logging refused transactions |
 | `src/output.rs` | the report writer |
-| `src/lib.rs`, `src/main.rs` | `run` and the command line |
+| `src/lib.rs` | `run`, `report`, the default worker count and channel limit |
+| `src/main.rs` | the command line, the Tokio runtime and `RUST_LOG` |
+| `src/test_support.rs` | helpers shared by the unit tests (tests only) |
 | `tests/` | CLI tests on the real binary, concurrency tests, fixtures |
 
 ## How correctness is checked
@@ -264,9 +267,10 @@ the few that wait use generous timeouts; `cargo test` takes a few seconds):
   around the batch size. Further tests cover per-client ordering, a channel of
   one, back-pressure, cancellation, a worker that panics or goes away, and the
   order in which failures are reported.
-- **Invariants.** On generated runs `held >= 0` and `total` is representable for
-  every account. (`total == available + held` holds by construction, since
-  `total` is computed that way.)
+- **Invariants.** On generated runs every row of the CSV report has
+  `total == available + held`, checked on the text with a parser that does not
+  use `Amount`, and every account has `held >= 0` and a total that does not
+  overflow.
 
 **Mutation checks, by hand.** During most tasks I made small deliberate breakages
 (a flipped comparison, a skipped step) in the code and confirmed that the tests
@@ -282,7 +286,10 @@ the exit code for a worker that panics, which is covered only in pieces (no test
 makes a worker panic through the binary); and the shared cap on logged
 refusals through the binary, which tells a shared cap from a per-worker one only
 on a machine with two or more cores. No automated advisory scan of the
-dependencies was run; the versions are pinned by `Cargo.lock`.
+dependencies was run (neither `cargo audit` nor `cargo deny` is installed). A
+reviewer compared the RustSec advisory database of 15 November 2026 with
+`Cargo.lock` by hand and found no applicable advisory and no yanked version. The
+versions are pinned by `Cargo.lock`.
 
 ## Errors and logging
 
@@ -324,6 +331,8 @@ wrote the same rows. The larger files below are the median of three runs.
 - The gain over sequential is modest (about 20%) because the reader, which parses
   the CSV, remains the limit. Going further would need the parsing itself to run
   in parallel.
+- Timed again with the larger files below, the same build took 1.75 s on the
+  3-million-row file, within noise of the 1.72 s above.
 - On a larger file of 9 million rows (243 MB) the concurrent build takes 5.3 s
   against 6.7 s for the sequential one.
 - Memory does not depend on the size of the input, only on how many deposits are
@@ -364,6 +373,8 @@ wrote the same rows. The larger files below are the median of three runs.
 - A trailing comma on every row is rejected as an extra field; leading zeros in
   ids are accepted.
 - A final row cut off without a line ending is read as complete (assumption 11).
+- Two byte order marks at the start are accepted (the reader skips one and the
+  csv crate a second).
 
 The data assumptions (a trusted source for disputes, a permanent lock, negative
 balances, unrecorded withdrawal ids, ids unique per client only, the balance
@@ -409,8 +420,11 @@ run the quality gates (`fmt`, `clippy -D warnings`, tests, `cargo doc`, release
 build), break the code on purpose to check the tests notice, then have
 independent reviewers look at the diff (a code reviewer, a security reviewer and
 a documentation reviewer) and fix what they found before the commit. The output
-writer, which has no rules logic, had no reviewers of its own. Two of those
-reviews are worth reading in the log: the review of the CLI found that a bad
+writer, which has no rules logic, had no reviewers of its own until the end.
+At the end the whole branch got a last review (a code review, a security review,
+a documentation review and an audit of the acceptance criteria against the code
+and tests); its findings and what was done with them are in the log (D29 to D31).
+Two of the earlier reviews are worth reading in the log: the review of the CLI found that a bad
 `TOKIO_WORKER_THREADS` crashed the binary with exit code 101, and a reviewer's
 timing showed that the first concurrent version was slower than the sequential
 one it replaced, which led to batching.

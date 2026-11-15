@@ -70,8 +70,10 @@ impl std::error::Error for ReadError {
 /// finished one.
 pub struct Transactions<R: Read> {
     reader: csv::Reader<RowLimit<SkipBom<R>>>,
-    headers: StringRecord,
+    columns: Columns,
     record: StringRecord,
+    /// The four required fields of the row being parsed, reused for every row.
+    narrow: StringRecord,
     /// How many rows have been skipped so far.
     skipped: u64,
     finished: bool,
@@ -99,8 +101,9 @@ pub fn read_transactions<R: Read>(reader: R) -> Result<Transactions<R>, ReadErro
     check_headers(&headers)?;
     Ok(Transactions {
         reader,
-        headers,
+        columns: Columns::new(&headers),
         record: StringRecord::new(),
+        narrow: StringRecord::new(),
         skipped: 0,
         finished: false,
     })
@@ -121,6 +124,39 @@ fn check_headers(headers: &StringRecord) -> Result<(), ReadError> {
         }
     }
     Ok(())
+}
+
+/// Where the required columns are in the header.
+///
+/// A row is cut down to the four fields it needs before it is parsed, so that
+/// the work for a row does not grow with the number of columns in the header,
+/// which the input chooses.
+struct Columns {
+    /// How many columns the header has.
+    width: usize,
+    /// The position of `type`, `client`, `tx` and `amount`, in that order.
+    positions: [usize; 4],
+    /// A header that names just the required columns, in that order.
+    names: StringRecord,
+}
+
+impl Columns {
+    /// Finds the required columns in a header that `check_headers` accepted. For
+    /// input with nothing in it, which has no rows, the positions are not used.
+    fn new(headers: &StringRecord) -> Self {
+        let mut positions = [0; 4];
+        for (position, column) in positions.iter_mut().zip(REQUIRED_COLUMNS) {
+            *position = headers
+                .iter()
+                .position(|name| name == column)
+                .unwrap_or_default();
+        }
+        Columns {
+            width: headers.len(),
+            positions,
+            names: StringRecord::from(REQUIRED_COLUMNS.to_vec()),
+        }
+    }
 }
 
 /// The bytes that may start a UTF-8 text file to say which encoding it uses.
@@ -271,21 +307,26 @@ impl fmt::Display for RowError {
     }
 }
 
-fn parse_row(record: &mut StringRecord, headers: &StringRecord) -> Result<Transaction, RowError> {
+fn parse_row(
+    record: &StringRecord,
+    columns: &Columns,
+    narrow: &mut StringRecord,
+) -> Result<Transaction, RowError> {
     // Rows may have any length, but fields beyond the header would be dropped
     // silently (a decimal comma written as an extra column, for instance).
-    if record.len() > headers.len() {
+    if record.len() > columns.width {
         return Err(RowError::InvalidField);
     }
-    // A row may also stop early, such as a dispute with no amount. The csv
-    // deserializer wants a field for every header column, so fill the gap with
-    // empty ones. A required field that was missing is then empty and still
-    // fails to parse, and an empty amount means there is none.
-    while record.len() < headers.len() {
-        record.push_field("");
+    // Keep just the required fields. A row may stop early, such as a dispute with
+    // no amount: a field it does not have is read as an empty one. A required
+    // field that was missing is then empty and still fails to parse, and an empty
+    // amount means there is none.
+    narrow.clear();
+    for position in columns.positions {
+        narrow.push_field(record.get(position).unwrap_or(""));
     }
-    let row: RawRow = record
-        .deserialize(Some(headers))
+    let row: RawRow = narrow
+        .deserialize(Some(&columns.names))
         .map_err(|_| RowError::InvalidField)?;
     Transaction::try_from(row).map_err(|MissingAmount| RowError::MissingAmount)
 }
@@ -326,7 +367,7 @@ impl<R: Read> Iterator for Transactions<R> {
         while !self.finished {
             match self.reader.read_record(&mut self.record) {
                 Ok(false) => self.finish(),
-                Ok(true) => match parse_row(&mut self.record, &self.headers) {
+                Ok(true) => match parse_row(&self.record, &self.columns, &mut self.narrow) {
                     Ok(transaction) => return Some(Ok(transaction)),
                     Err(reason) => self.skip(row_of(self.record.position()), reason),
                 },
@@ -950,6 +991,35 @@ mod tests {
         });
         assert!(first.expect("an item").is_err());
         assert!(logs.contains("skipped=2"), "logs: {logs}");
+    }
+
+    #[test]
+    fn a_row_is_narrowed_to_the_four_required_columns_whatever_the_header_width() {
+        // 500 extra columns before the required ones: the work for a row must not
+        // grow with them, so the row is cut down to the four fields it needs.
+        let mut names = vec!["junk"; 500];
+        names.extend(["type", "client", "tx", "amount"]);
+        let headers = StringRecord::from(names);
+        check_headers(&headers).expect("the header is fine");
+        let columns = Columns::new(&headers);
+
+        let mut fields = vec!["x"; 500];
+        fields.extend(["dispute", "1", "2"]); // stops before the amount column
+        let record = StringRecord::from(fields);
+        let mut narrow = StringRecord::new();
+        assert_eq!(
+            parse_row(&record, &columns, &mut narrow),
+            Ok(Transaction::Dispute { client: 1, tx: 2 })
+        );
+        assert_eq!(narrow.len(), 4);
+
+        // A row wider than the header is still a bad row.
+        let mut too_many = vec!["x"; 504];
+        too_many.push("y");
+        assert_eq!(
+            parse_row(&StringRecord::from(too_many), &columns, &mut narrow),
+            Err(RowError::InvalidField)
+        );
     }
 
     #[test]

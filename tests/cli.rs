@@ -599,6 +599,7 @@ fn the_usage_line_names_the_argument() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_open_error_names_the_file_and_the_reason() {
     let missing = input_file("present4.csv", b"").with_file_name("absent-file-name.csv");

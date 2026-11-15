@@ -20,7 +20,8 @@ pub(crate) struct RefusalLog {
 
 impl RefusalLog {
     /// Counts a refusal and logs it if it is among the first few. Returns
-    /// whether this one was logged.
+    /// whether this one was logged (the pipeline does not need to know; the tests
+    /// do).
     ///
     /// A refusal that means the engine's own balances are inconsistent
     /// ([`Rejection::InsufficientHeld`]) is always logged, at error level, and
