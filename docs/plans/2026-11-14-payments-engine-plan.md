@@ -28,7 +28,7 @@ AC numbers below refer to the numbered acceptance criteria in the spec.
 - [x] Task 6: Output writer — `2b23831`
 - [x] Task 7: Sequential end-to-end CLI — `1e12659`
 - [x] Task 8: Sharded concurrent pipeline — `a327fa2`
-- [ ] Task 9: Switch the CLI to the concurrent pipeline and failure handling
+- [x] Task 9: Switch the CLI to the concurrent pipeline and failure handling — `ea99ee2`
 - [ ] Task 10: README and final verification
 
 Follow-up commits that belong to finished tasks: `477aa49` (tests build amounts
