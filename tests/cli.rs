@@ -422,6 +422,30 @@ fn a_tokio_worker_threads_value_that_is_not_utf8_does_not_crash_the_run() {
 }
 
 #[test]
+fn the_example_in_the_readme_is_a_fixture_and_gives_the_report_shown_there() {
+    let report = format!("{HEADER}3,3.5000,0.0000,3.5000,false\n7,-1.2500,5.0000,3.7500,false\n");
+    let outcome = run_on(&fixture("example.csv"));
+    assert_eq!(outcome.code, Some(0));
+    assert_eq!(outcome.stdout, report);
+    let refusal = line_with(&outcome.stderr, "transaction rejected");
+    assert!(refusal.contains("client=3 tx=14 "), "{refusal}");
+
+    // The README shows the same input and the same report, so that they cannot
+    // drift apart from what the binary does.
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .expect("the README is readable");
+    let input = fs::read_to_string(fixture("example.csv")).expect("the fixture is readable");
+    assert!(
+        readme.contains(&input),
+        "the README does not show the fixture"
+    );
+    assert!(
+        readme.contains(&report),
+        "the README does not show the report"
+    );
+}
+
+#[test]
 fn an_empty_rust_log_counts_as_unset() {
     let outcome = run_with(&[fixture("basic.csv").as_os_str()], Some(""));
     assert_eq!(outcome.code, Some(0));

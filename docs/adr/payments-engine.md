@@ -573,3 +573,26 @@ From 64 up the time is the same within noise, so 256 sits on the plateau, with C
 **Cost**: The router buffers up to 255 transactions for each shard. A buffer grows as rows arrive, so a shard that gets few rows holds little, and only a shard that has filled a batch keeps room for a full one (4 KiB with 16-byte transactions, which a reviewer measured), so the memory is proportional to the input. The first version reserved a full buffer on a shard's first row; a reviewer measured 442 MB of peak memory against 154 MB for a file of 65,536 rows naming every client id, with a library caller asking for 65,536 shards (the command line is not affected, as it uses one shard per core), and growing the buffers on demand removed that. A worker can be behind by `capacity` plus two batches (the channel, the batch the router waits to send, and the batch the worker is applying). A transaction waits for its batch to fill; that does not matter for a file, but a front end serving live streams would need a flush timeout. AC 29 now says the bound excludes the router's one batch.
 **Correction to D11**: the capacity limit no longer protects the channel from a panic, because the limit is divided by the batch size before it reaches the channel. It still bounds the memory a stalled worker can pin, which is why it stays.
 **Alternatives considered**: One message per transaction (slower than sequential); a batch of 1024 or more (the same time, more memory in flight); parsing in parallel (a different design, not needed for a file); an unbounded channel (no backpressure).
+
+## D27 — 2026-11-15 — Task 10: README and final verification
+
+**Status**: Accepted
+**Decision**: The spec, the plan and this decision log stay in the repository, and the README points to them in a section on how the project was built.
+**Reason**: The author wants a reviewer to be able to follow the way the work was done: the spec before the code, the plan with a commit for each task, the decisions with their alternatives, and what the independent reviews found. The documents are written in the author's own words and do not reproduce the task statement or its example rows.
+**Alternatives considered**: Removing them before submission, which was the plan's default at the end of Task 10.
+
+## D28 — 2026-11-15 — Task 10: README and final verification
+
+**Status**: Accepted
+**Decision**: The README states the measured memory and time of the large-input check, and gives the deposit history as the one limit on memory.
+**Reason**: I ran the release build on generated files (5,000 clients, `RUST_LOG=off`, median of three runs, a 10-core machine):
+
+| Input | Size | Wall s | CPU s | Peak MB |
+|---|---|---|---|---|
+| 1 million rows, with deposits | 26 MB | 0.58 | 0.70 | 29 |
+| 3 million rows, with deposits | 80 MB | 1.75 | 2.16 | 125 |
+| 9 million rows, with deposits | 243 MB | 5.27 | 6.75 | 521 |
+| 9 million rows, no deposits | 257 MB | 5.02 | 5.41 | 4 |
+
+The sequential build (commit `a327fa2`) took 6.74 s and 422 MB on the 9-million-row file with deposits, and 5.07 s and 3 MB on the one without. Memory therefore does not depend on the size of the input: the file with no deposits peaks at 4 MB however long it is. It grows with the number of deposits recorded, at roughly 45 to 105 bytes each (about 100 bytes at the largest size, where about 5 million deposits are recorded), and the concurrent build uses about 100 MB more than the sequential one at that size. The concurrent build is faster on the largest file (5.3 s against 6.7 s) and the same where nothing is applied, because parsing is the limit there.
+**Alternatives considered**: Not measuring a file larger than 3 million rows, which would have left the growth with deposits unquantified.
